@@ -340,3 +340,261 @@ export interface UsgsEventLite {
   nodalPlane?: { strike: number; dip: number; rake: number };
   momentTensorSource?: string;
 }
+
+/* ==================================================================== */
+/* Time-series stack types (system plan §6/§12: SBAS engine inputs)      */
+/* ==================================================================== */
+
+/** One acquisition epoch of a GUNW stack. */
+export interface StackEpoch {
+  index: number;
+  /** ISO-8601 acquisition time. */
+  time: string;
+}
+
+/** One interferogram of the SBAS network. */
+export interface StackIfgMeta {
+  /** Index of the reference (earlier) epoch. */
+  refIndex: number;
+  /** Index of the secondary (later) epoch. */
+  secIndex: number;
+  /** Temporal baseline in days. */
+  temporalBaselineDays: number;
+}
+
+/** Causal hypothesis classes of the Bayesian engine (plan §8). */
+export type CausalClass = 'quake' | 'subsid' | 'slide';
+
+/** Stage-3 feature vector for the Bayesian engine (plan §8 Stage 3). */
+export interface CausalFeatures {
+  /** Spatial displacement gradient across the anomaly (m/km). */
+  gradS: number;
+  /** Linear-trend R² of the displacement time series (temporal linearity). */
+  tempLinearity: number;
+  /** Pearson correlation between displacement and DEM elevation. */
+  demCorr: number;
+  /** Polarimetric cross-ratio shift (GCOV); NaN when GCOV not ingested. */
+  polShift?: number;
+}
+
+/** Stage-5 priors from geographic context (plan §8 Stage 5). */
+export interface CausalPriors {
+  /** Proximity to mapped fault traces (0..1). */
+  quake: number;
+  /** Proximity to hydrogeological basin boundaries (0..1). */
+  subsid: number;
+  /** Proximity to steep slopes (0..1). */
+  slide: number;
+}
+
+/** Stage-4 forward-model residuals for the consistency terms (plan §8). */
+export interface ForwardModelResiduals {
+  /** Okada H1 residual RMSE (m) and tolerance (m). */
+  quakeRmseM: number;
+  quakeSigmaM: number;
+  /** Linear+seasonal H2 residual RMSE (m) and tolerance (m). */
+  trendRmseM: number;
+  trendSigmaM: number;
+  /** Slope-parallel H3 residual RMSE (m) and tolerance (m). */
+  slopeRmseM: number;
+  slopeSigmaM: number;
+}
+
+/** A synthetic-stack catalog event (exercise fixture for the engine). */
+export interface StackCatalogEvent {
+  id: string;
+  label: string;
+  magnitude: number;
+  place: string;
+  time: string;
+  lat: number;
+  lon: number;
+  depthKm: number;
+  url: string;
+  nodalPlane: { strike: number; dip: number; rake: number };
+  /** True when this is a synthetic fixture event, not a real catalog entry. */
+  synthetic: boolean;
+}
+
+/** GNSS validation station (plan §9: NGL continuous network). */
+export interface GnssStation {
+  id: string;
+  lat: number;
+  lon: number;
+  /** Published 3D velocity components (mm/yr, ENU convention). */
+  eastMmPerYr: number;
+  northMmPerYr: number;
+  upMmPerYr: number;
+  /** 1σ per component (mm/yr). */
+  sigmaMm: number;
+  /** Honest labelling of the velocity source. */
+  source: string;
+}
+
+/** Result of projecting one station into the radar LOS. */
+export interface GnssLosComparison {
+  stationId: string;
+  lat: number;
+  lon: number;
+  /** GNSS 3D velocity projected to LOS (mm/yr; + = away from satellite). */
+  gnssLosMmPerYr: number;
+  /** InSAR LOS velocity sampled at the station (mm/yr). */
+  insarLosMmPerYr: number;
+  /** GNSS − InSAR (mm/yr). */
+  diffMmPerYr: number;
+  /** Nearest-pixel distance (km). */
+  distanceKm: number;
+}
+
+export interface GnssValidation {
+  /** Per-station comparisons (plan §11 protocol). */
+  stations: GnssLosComparison[];
+  /** RMSE of InSAR vs GNSS LOS velocities (mm/yr). */
+  rmseMmPerYr: number;
+  /** Mean (InSAR − GNSS) bias (mm/yr). */
+  biasMmPerYr: number;
+  /** Number of stations used. */
+  n: number;
+  note: string;
+}
+
+/** Phase-budget ledger entry (plan §6 decomposition, corrected terms). */
+export interface PhaseBudgetEntry {
+  key: string;
+  label: string;
+  /** RMS magnitude of the term over valid pixels (m of LOS range). */
+  rmsM: number;
+  note: string;
+}
+
+export interface PhaseBudget {
+  /** Interferometric-phase terms quantified for the stack (plan §6). */
+  entries: PhaseBudgetEntry[];
+  methodNote: string;
+}
+
+/* ==================================================================== */
+/* SBAS pipeline result (system plan §12 pipeline, §13 stages)           */
+/* ==================================================================== */
+
+/** One PELT change point with interpretation. */
+export interface ChangePointMark {
+  /** Epoch index AFTER which the change occurs (series is per-epoch). */
+  afterEpochIndex: number;
+  /** ISO time of the epoch before the change. */
+  time: string;
+  /** Step magnitude across the change (m). */
+  stepM: number;
+  note: string;
+}
+
+/** A time series extracted for one location of interest. */
+export interface KeySeries {
+  id: string;
+  label: string;
+  /** Grid pixel indices. */
+  i: number;
+  j: number;
+  /** Epoch times (ISO). */
+  times: string[];
+  /** Cumulative LOS displacement per epoch (m; + = away from satellite). */
+  displacementM: number[];
+  /** 1σ per epoch (m). */
+  sigmaM: number[];
+  /** PELT change points. */
+  changePoints: ChangePointMark[];
+  /** Linear-trend R² (temporal linearity feature). */
+  linearR2: number;
+  /** Mean velocity from the regression (m/yr). */
+  velocityMPerYr: number;
+  note: string;
+}
+
+/** One attributed anomaly cluster (Bayesian engine output + geometry). */
+export interface AnomalyAttribution {
+  /** Stable anomaly id (used by POST /api/v1/attribute). */
+  id: string;
+  label: string;
+  /** Pixel count and area. */
+  pixelCount: number;
+  areaKm2: number;
+  /** Centroid + bounding box in grid pixels. */
+  centroid: { i: number; j: number };
+  bbox: { i0: number; j0: number; i1: number; j1: number };
+  /** Peak |velocity| inside the cluster (m/yr). */
+  peakVelocityMPerYr: number;
+  /** Stage-3 features. */
+  features: CausalFeatures;
+  /** Stage-5 priors used. */
+  priors: CausalPriors;
+  /** Stage-4/5 forward residuals (when computable). */
+  residuals?: ForwardModelResiduals;
+  /** The Bayesian engine output. */
+  bayes: import('./bayes').BayesianAttribution;
+}
+
+/** Velocity-field summary statistics. */
+export interface SbasSummary {
+  /** Pixels passing the quality gates. */
+  validPixelCount: number;
+  validFraction: number;
+  /** Temporal-coherence gate retention (plan §11 benchmark). */
+  temporalCoherenceRetainedFraction: number;
+  /** Area of one pixel (km²). */
+  pixelAreaKm2: number;
+  analysedAreaKm2: number;
+  /** Velocity extremes over valid pixels (m/yr; + = away). */
+  maxVelocityMPerYr: number;
+  minVelocityMPerYr: number;
+  medianVelocityMPerYr: number;
+  medianVelocitySigmaMPerYr: number;
+  /** Area moving faster than the rate threshold toward/away (km²). */
+  fastAreaKm2: number;
+  /** Rate threshold used (m/yr). */
+  rateThresholdMPerYr: number;
+  /** Median temporal coherence over valid pixels. */
+  medianTemporalCoherence: number;
+  /** Number of epochs / interferograms inverted. */
+  epochCount: number;
+  ifgCount: number;
+  /** Regularization λ chosen by the L-curve. */
+  lambda: number;
+  lambdaCriterion: string;
+}
+
+/** Full SBAS pipeline result (mirrors AnalysisResult for stack datasets). */
+export interface SbasResult {
+  kind: 'sbas';
+  datasetId: string;
+  /** Epoch times (ISO) — the cumulative-cube axis. */
+  epochs: string[];
+  params: AnalysisParams;
+  summary: SbasSummary;
+  /** Velocity transport (displacement slot = m/yr; coherence slot = temporal coherence). */
+  velocity: TransportGrid;
+  /** Cumulative displacement per epoch, downsampled for transport. */
+  cumulative: {
+    meta: GridMeta;
+    /** Base64 Float32 per epoch (NaN = masked). */
+    grids: string[];
+    /** Base64 Uint8 shared valid-mask. */
+    mask: string;
+  };
+  /** Time series at key locations (anomaly centroids, reference, extremes). */
+  keySeries: KeySeries[];
+  /** Bayesian attribution per anomaly cluster. */
+  anomalies: AnomalyAttribution[];
+  /** Phase-budget correction ledger (plan §6). */
+  corrections: PhaseBudget;
+  /** GNSS cross-validation (plan §11). */
+  gnss: GnssValidation;
+  /** Brier score calibration over labeled zones (plan §7/§11). */
+  brier?: { score: number; n: number; note: string };
+  /** Validation vs analytic truth when the stack provides it. */
+  truthValidation?: { velocityRmseMPerYr: number; note: string };
+  /** Catalog events relevant to the stack window (earthquake focus). */
+  events: StackCatalogEvent[];
+  narrative: { verdict: string; whatChanged: string; howMuch: string; reliability: string };
+  warnings: string[];
+  processingMs: number;
+}

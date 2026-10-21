@@ -1,0 +1,811 @@
+     1→/**
+     2→ * Stage E — cause investigation (attribution layer).
+     3→ *
+     4→ * Attribution is built ON TOP of validated change measurements and
+     5→ * independent evidence. It is a transparent rule-based screen, not a trained
+     6→ * classifier: every status is traceable to an explicit evidence item, and
+     7→ * the layer is required to say "insufficient evidence" rather than guess.
+     8→ *
+     9→ * Independent evidence used:
+    10→ *   - USGS ComCat events (FDSN API) inside the acquisition window and
+    11→ *     within/near the frame footprint.
+    12→ *   - Okada (1985) forward modelling from the published USGS moment-tensor
+    13→ *     nodal plane (strike/dip/rake) with empirical magnitude-area scaling
+    14→ *     (Wells & Coppersmith 1994) and the Hanks & Kanamori (1979) moment.
+    15→ *
+    16→ * The forward model is a CONSISTENCY SCREEN, not an inversion: we compare
+    17→ * the predicted and measured fields' amplitudes and spatial correlation and
+    18→ * report agreement classes, never a probability of causation. Agreement is
+    19→ * NOT causal proof — the same pattern could in principle be produced by
+    20→ * other sources; the output language says "consistent with", never "caused
+    21→ * by".
+    22→ *
+    23→ * REMEDIATION NOTES (2026-10-21):
+    24→ *   - Event selection is now an explicit, documented ranking
+    25→ *     (rankEventsForPair); the first API result is never assumed to be the
+    26→ *     most relevant.
+    27→ *   - The forward model is anchored at the EVENT EPICENTRE projected into
+    28→ *     the raster's own coordinate reference system (was: raster centre —
+    29→ *     a misplacement whenever the epicentre is not at the grid centre).
+    30→ *   - All numeric screening thresholds are collected in
+    31→ *     ATTRIBUTION_HEURISTICS, labelled exploratory, and exposed in the
+    32→ *     output metadata. None of them is a calibrated statistic.
+    33→ *   - Hypothesis language distinguishes "no detection above threshold"
+    34→ *     from "no change", and never treats a single unwrapping component as
+    35→ *     proof of artefact absence.
+    36→ */
+    37→
+    38→import type {
+    39→  AttributionOutput,
+    40→  ChangeSummary,
+    41→  Hypothesis,
+    42→  RadarGeometry,
+    43→  ScienceDataset,
+    44→  UsgsEventLite,
+    45→  Raster,
+    46→  GridMeta,
+    47→} from './types';
+    48→import { pearson } from './statistics';
+    49→import {
+    50→  geoFaultDisplacementENU,
+    51→  momentFromMw,
+    52→  ruptureAreaFromMw,
+    53→  slipFromMoment,
+    54→} from './okada';
+    55→import { projectDisplacementToLOS, losUnitVector } from './los-projection';
+    56→import { latLonToUtmInZone, zoneFromEpsg } from './utm';
+    57→
+    58→// ---------------------------------------------------------------------------
+    59→// Exploratory screening heuristics — values and rationale.
+    60→//
+    61→// NONE of these numbers is a calibrated statistic: they are order-of-magnitude
+    62→// conventions chosen so the screen is neither trivially permissive nor
+    63→// trivially strict, and they are exposed in every result so a reader can
+    64→// judge (and reproduce) the classification. Sensitivity to each value is
+    65→// exercised in tests/science/attribution.test.ts.
+    66→
+    67→export interface AttributionHeuristics {
+    68→  /** Peak-|LOS| below this (mm) keeps "atmospheric residual" plausible. */
+    69→  atmosphericPeakMm: number;
+    70→  /** Measured/predicted peak ratio within [1/ratioFactor, ratioFactor] passes the amplitude check. */
+    71→  amplitudeRatioFactor: number;
+    72→  /** Predicted-vs-measured spatial correlation above this passes the pattern check. */
+    73→  patternCorrelation: number;
+    74→}
+    75→
+    76→export const ATTRIBUTION_HEURISTICS: AttributionHeuristics = {
+    77→  atmosphericPeakMm: 30,
+    78→  amplitudeRatioFactor: 3,
+    79→  patternCorrelation: 0.25,
+    80→};
+    81→
+    82→export const HEURISTICS_NOTE =
+    83→  'Exploratory screening values, not calibrated statistics: peak < ' +
+    84→  `${ATTRIBUTION_HEURISTICS.atmosphericPeakMm} mm keeps an atmospheric residual plausible ` +
+    85→  '(order of uncorrected tropospheric residuals for L-band pairs; Hanssen 2001 ch. 6); ' +
+    86→  `amplitude ratio within a factor of ${ATTRIBUTION_HEURISTICS.amplitudeRatioFactor} reflects the ` +
+    87→  'scatter of the Wells & Coppersmith (1994) magnitude-area scaling (±0.25 decades ≈ factor 1.8, ' +
+    88→  'plus uniform-slip idealisation); spatial correlation > ' +
+    89→  `${ATTRIBUTION_HEURISTICS.patternCorrelation} is a weak pattern-agreement floor. ` +
+    90→  'Passing these checks means "consistent with the model", never "caused by".';
+    91→
+    92→/** Great-circle distance in km (spherical Earth). */
+    93→export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    94→  const R = 6371.0088;
+    95→  const toRad = (d: number) => (d * Math.PI) / 180;
+    96→  const dLat = toRad(lat2 - lat1);
+    97→  const dLon = toRad(lon2 - lon1);
+    98→  const a =
+    99→    Math.sin(dLat / 2) ** 2 +
+   100→    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+   101→  return 2 * R * Math.asin(Math.sqrt(a));
+   102→}
+   103→
+   104→/** Distance from a point to the polygon centroid (km) — coarse containment proxy. */
+   105→export function distanceToFootprintKm(ds: ScienceDataset, lat: number, lon: number): number {
+   106→  const poly = ds.footprintPolygon;
+   107→  if (!poly || poly.length === 0) return NaN;
+   108→  let cx = 0;
+   109→  let cy = 0;
+   110→  for (const [x, y] of poly) {
+   111→    cx += x;
+   112→    cy += y;
+   113→  }
+   114→  cx /= poly.length;
+   115→  cy /= poly.length;
+   116→  return haversineKm(lat, lon, cy, cx);
+   117→}
+   118→
+   119→// ---------------------------------------------------------------------------
+   120→// Event selection (§6 of the remediation): explicit ranking, alternatives,
+   121→// criteria metadata. Never "the first API result".
+   122→
+   123→export interface EventSelection {
+   124→  /** Ranked best-first; only events strictly inside the acquisition window. */
+   125→  ranked: UsgsEventLite[];
+   126→  /** The highest-ranked candidate (undefined when none qualify). */
+   127→  primary?: UsgsEventLite;
+   128→  /** Lower-ranked in-window candidates, best-first. */
+   129→  alternatives: UsgsEventLite[];
+   130→  /** Machine-readable description of how the ranking was computed. */
+   131→  criteria: {
+   132→    window: { start: string; end: string };
+   133→    maxDistanceKm: number;
+   134→    distanceTo: 'footprint centroid';
+   135→    ranking: string;
+   136→    magnitudeHandling: string;
+   137→    mechanismHandling: string;
+   138→  };
+   139→  /** Events seen by the caller but excluded, with the reason. */
+   140→  excluded: Array<{ id: string; reason: string }>;
+   141→}
+   142→
+   143→/**
+   144→ * Rank USGS events for one interferometric pair.
+   145→ *
+   146→ * Criteria (in priority order, no hidden composite score):
+   147→ *   1. The origin time must fall strictly inside (reference, secondary).
+   148→ *   2. The event must be within maxDistanceKm of the footprint centroid.
+   149→ *   3. Candidates are ordered by expected relevance to a measurable
+   150→ *      deformation signal: magnitude (larger first), then distance to the
+   151→ *      footprint (nearer first), then availability of a moment-tensor
+   152→ *      mechanism (available first).
+   153→ *
+   154→ * Events with a missing magnitude are kept but ranked last (they may still
+   155→ * be informative context); events outside the window/distance are excluded
+   156→ * with an explicit reason.
+   157→ */
+   158→export function rankEventsForPair(
+   159→  events: UsgsEventLite[],
+   160→  ds: ScienceDataset,
+   161→  opts: { maxDistanceKm?: number } = {},
+   162→): EventSelection {
+   163→  const maxDistanceKm = opts.maxDistanceKm ?? 300;
+   164→  const t0 = Date.parse(ds.provenance.referenceTime);
+   165→  const t1 = Date.parse(ds.provenance.secondaryTime);
+   166→  const excluded: EventSelection['excluded'] = [];
+   167→  const inWindow: UsgsEventLite[] = [];
+   168→
+   169→  for (const ev of events) {
+   170→    const t = Date.parse(ev.time);
+   171→    if (!Number.isFinite(t)) {
+   172→      excluded.push({ id: ev.id, reason: 'event time is not parseable' });
+   173→      continue;
+   174→    }
+   175→    if (!(t > t0 && t < t1)) {
+   176→      excluded.push({
+   177→        id: ev.id,
+   178→        reason: `origin time outside the acquisition window (${ds.provenance.referenceTime.slice(0, 10)} … ${ds.provenance.secondaryTime.slice(0, 10)})`,
+   179→      });
+   180→      continue;
+   181→    }
+   182→    const dist = distanceToFootprintKm(ds, ev.lat, ev.lon);
+   183→    if (Number.isNaN(dist)) {
+   184→      excluded.push({ id: ev.id, reason: 'footprint unavailable; cannot check distance' });
+   185→      continue;
+   186→    }
+   187→    if (dist > maxDistanceKm) {
+   188→      excluded.push({
+   189→        id: ev.id,
+   190→        reason: `${dist.toFixed(0)} km from the footprint centroid (> ${maxDistanceKm} km)`,
+   191→      });
+   192→      continue;
+   193→    }
+   194→    inWindow.push(ev);
+   195→  }
+   196→
+   197→  const distanceOf = (ev: UsgsEventLite) => distanceToFootprintKm(ds, ev.lat, ev.lon);
+   198→  const ranked = [...inWindow].sort((a, b) => {
+   199→    // Missing magnitudes rank last within the same distance class.
+   200→    const magA = Number.isFinite(a.magnitude) ? a.magnitude : -Infinity;
+   201→    const magB = Number.isFinite(b.magnitude) ? b.magnitude : -Infinity;
+   202→    if (magB !== magA) return magB - magA;
+   203→    const dA = distanceOf(a);
+   204→    const dB = distanceOf(b);
+   205→    if (dA !== dB) return dA - dB;
+   206→    const mA = a.nodalPlane ? 1 : 0;
+   207→    const mB = b.nodalPlane ? 1 : 0;
+   208→    if (mB !== mA) return mB - mA;
+   209→    return a.id.localeCompare(b.id); // deterministic tie-break
+   210→  });
+   211→
+   212→  return {
+   213→    ranked,
+   214→    primary: ranked[0],
+   215→    alternatives: ranked.slice(1),
+   216→    criteria: {
+   217→      window: { start: ds.provenance.referenceTime, end: ds.provenance.secondaryTime },
+   218→      maxDistanceKm,
+   219→      distanceTo: 'footprint centroid',
+   220→      ranking:
+   221→        'in-window candidates ordered by magnitude (descending), then distance to the footprint ' +
+   222→        'centroid (ascending), then moment-tensor availability; ties broken by event id. This ' +
+   223→        'favours the event most likely to produce a measurable signal — it is a relevance order, ' +
+   224→        'not a statement that the selected event caused anything.',
+   225→      magnitudeHandling:
+   226→        'events with a missing magnitude are kept but ranked last (context only); magnitude type is recorded on each event',
+   227→      mechanismHandling:
+   228→        'a published moment-tensor nodal plane is required for any quantitative forward-model check; without one the check is skipped, never invented',
+   229→    },
+   230→    excluded,
+   231→  };
+   232→}
+   233→
+   234→// ---------------------------------------------------------------------------
+   235→// Forward model — epicentre-anchored, projection-aware.
+   236→
+   237→/**
+   238→ * Project a geographic point (lat/lon) into the coordinate reference system
+   239→ * of a raster grid.
+   240→ *
+   241→ * Supported CRS: WGS84 UTM (EPSG 326xx / 327xx) — the CRS of the NISAR GUNW
+   242→ * products we consume. Polar stereographic granules (EPSG 3413/3031) would
+   243→ * need a different inverse; for those the forward model is disabled with an
+   244→ * explanation instead of silently misplacing it.
+   245→ */
+   246→export function projectToGrid(
+   247→  lat: number,
+   248→  lon: number,
+   249→  meta: GridMeta,
+   250→): { x: number; y: number } | { error: string } {
+   251→  const zone = zoneFromEpsg(meta.epsg);
+   252→  if (!zone) {
+   253→    return {
+   254→      error:
+   255→        `grid EPSG ${meta.epsg} is not WGS84 UTM; the forward model only supports UTM grids ` +
+   256→        '(polar-stereographic granules would need a different projection — refusing rather than misplacing the model)',
+   257→    };
+   258→  }
+   259→  try {
+   260→    const u = latLonToUtmInZone(lat, lon, zone.zone);
+   261→    return { x: u.easting, y: u.northing };
+   262→  } catch (err) {
+   263→    return { error: `projection failed: ${(err as Error).message}` };
+   264→  }
+   265→}
+   266→
+   267→/** Build a fault model from a USGS event (documented assumptions). */
+   268→export function faultFromEvent(event: UsgsEventLite): {
+   269→  fault: import('./okada').GeoFault;
+   270→  centroidDepthM: number;
+   271→} | { error: string } {
+   272→  const np = event.nodalPlane;
+   273→  if (!np) {
+   274→    return { error: 'no moment-tensor nodal plane published for this event' };
+   275→  }
+   276→  if (!Number.isFinite(event.magnitude)) {
+   277→    return { error: 'event magnitude is missing; scaling relations need it' };
+   278→  }
+   279→  if (!Number.isFinite(event.depthKm) || event.depthKm < 0) {
+   280→    return { error: 'hypocentral depth is missing or negative' };
+   281→  }
+   282→  const area = ruptureAreaFromMw(event.magnitude);
+   283→  const moment = momentFromMw(event.magnitude);
+   284→  // Aspect ratio 2:1 (documented assumption).
+   285→  const width = Math.sqrt(area / 2);
+   286→  const length = 2 * width;
+   287→  const slip = slipFromMoment(moment, area);
+   288→  const centroidDepth = Math.max(4000, event.depthKm * 1000);
+   289→  return {
+   290→    fault: {
+   291→      strikeDeg: np.strike,
+   292→      dipDeg: np.dip,
+   293→      rakeDeg: np.rake,
+   294→      lengthM: length,
+   295→      widthM: width,
+   296→      topDepthM: 0, // computed inside geoFaultDisplacementENU from centroid depth
+   297→      slipM: slip,
+   298→      centroidLat: event.lat,
+   299→      centroidLon: event.lon,
+   300→    },
+   301→    centroidDepthM: centroidDepth,
+   302→  };
+   303→}
+   304→
+   305→/**
+   306→ * Forward-model consistency check: predict LOS displacement from a USGS
+   307→ * event's nodal plane over the dataset grid, compare with measurement.
+   308→ *
+   309→ * COORDINATE FRAME (remediated 2026-10-21): the epicentre is projected into
+   310→ * the raster's own CRS (UTM zone from the grid EPSG) and per-pixel offsets
+   311→ * are taken RELATIVE TO THE EPICENTRE — not relative to the raster centre.
+   312→ * Moving the earthquake therefore moves the predicted field; moving the grid
+   313→ * origin does not (asserted in tests/science/attribution.test.ts).
+   314→ */
+   315→export function forwardModelCheck(
+   316→  ds: ScienceDataset,
+   317→  event: UsgsEventLite | undefined,
+   318→  displacement: Float32Array | undefined,
+   319→  mask: Uint8Array | undefined,
+   320→): AttributionOutput['forwardModelCheck'] | undefined {
+   321→  if (!event || !ds.phase || !displacement) return undefined;
+   322→
+   323→  const faultRes = faultFromEvent(event);
+   324→  if ('error' in faultRes) {
+   325→    return {
+   326→      eventId: event.id,
+   327→      skipped: true,
+   328→      skipReason: faultRes.error,
+   329→      amplitudeRatio: NaN,
+   330→      patternCorrelation: NaN,
+   331→      predictedPeakM: NaN,
+   332→      measuredPeakM: NaN,
+   333→      note:
+   334→        'Forward-model check skipped: ' +
+   335→        faultRes.error +
+   336→        '. No fault geometry was invented; the coseismic hypothesis remains unevaluated quantitatively.',
+   337→    };
+   338→  }
+   339→
+   340→  const meta = ds.phase.meta;
+   341→  const epi = projectToGrid(event.lat, event.lon, meta);
+   342→  if ('error' in epi) {
+   343→    return {
+   344→      eventId: event.id,
+   345→      skipped: true,
+   346→      skipReason: epi.error,
+   347→      amplitudeRatio: NaN,
+   348→      patternCorrelation: NaN,
+   349→      predictedPeakM: NaN,
+   350→      measuredPeakM: NaN,
+   351→      note: 'Forward-model check skipped: ' + epi.error,
+   352→    };
+   353→  }
+   354→
+   355→  const { fault, centroidDepthM } = faultRes;
+   356→  const los = losUnitVector(
+   357→    ds.geometry.incidenceAngleDeg,
+   358→    ds.geometry.headingDeg,
+   359→    ds.geometry.lookDirection,
+   360→  );
+   361→
+   362→  // Evaluate on a deterministic strided subgrid: the Okada field is smooth at
+   363→  // grid scale, so a subgrid carries the same amplitude/pattern information
+   364→  // while keeping the consistency screen cheap on large NISAR frames
+   365→  // (full frames reach ~2e7 pixels). Peaks are computed with explicit loops
+   366→  // (never argument spreads, which overflow on large arrays).
+   367→  const n = meta.width * meta.height;
+   368→  const stride = Math.max(1, Math.floor(n / 400000));
+   369→  const meas: number[] = [];
+   370→  const prd: number[] = [];
+   371→  let predPeak = 0;
+   372→  let measuredPeak = 0;
+   373→
+   374→  for (let idx = 0; idx < n; idx += stride) {
+   375→    const i = Math.floor(idx / meta.width);
+   376→    const j = idx % meta.width;
+   377→    // Offsets RELATIVE TO THE EPICENTRE in the raster's own projection.
+   378→    const x = meta.xStart + j * meta.xSpacing - epi.x;
+   379→    const y = meta.yStart + i * meta.ySpacing - epi.y;
+   380→    const d = geoFaultDisplacementENU(fault, centroidDepthM, x, y);
+   381→    if (d.singular) continue;
+   382→    const losM = projectDisplacementToLOS(d, los);
+   383→    if (Math.abs(losM) > Math.abs(predPeak)) predPeak = losM;
+   384→    if (mask && !mask[idx]) continue;
+   385→    const dv = displacement[idx];
+   386→    if (!Number.isNaN(dv)) {
+   387→      meas.push(dv);
+   388→      prd.push(losM);
+   389→      if (Math.abs(dv) > measuredPeak) measuredPeak = Math.abs(dv);
+   390→    }
+   391→  }
+   392→
+   393→  const amplitudeRatio =
+   394→    Math.abs(predPeak) > 1e-9 ? measuredPeak / Math.abs(predPeak) : NaN;
+   395→  const corr = pearson(prd, meas);
+   396→
+   397→  return {
+   398→    eventId: event.id,
+   399→    skipped: false,
+   400→    amplitudeRatio: Number.isNaN(amplitudeRatio) ? 0 : amplitudeRatio,
+   401→    patternCorrelation: Number.isNaN(corr) ? 0 : corr,
+   402→    predictedPeakM: predPeak,
+   403→    measuredPeakM: measuredPeak,
+   404→    epicentre: { lat: event.lat, lon: event.lon, projectedX: epi.x, projectedY: epi.y, epsg: meta.epsg },
+   405→    note:
+   406→      'Predicted field uses a uniform-slip rectangular dislocation with the published nodal plane, ' +
+   407→      'anchored at the epicentre projected into the raster CRS (EPSG ' + meta.epsg + '); ' +
+   408→      'fault dimensions follow empirical magnitude-area scaling with substantial scatter, so only ' +
+   409→      'order-of-magnitude amplitude agreement is meaningful. Evaluated on a deterministic subgrid ' +
+   410→      `of about ${Math.floor(n / stride)} points (the model field is smooth at grid scale). ` +
+   411→      'Agreement classes are exploratory screening, not causation.',
+   412→  };
+   413→}
+   414→
+   415→/** Build the Okada forward-model LOS prediction on an arbitrary grid (epicentre-anchored). */
+   416→export function buildPredictionOnGrid(
+   417→  meta: GridMeta,
+   418→  event: UsgsEventLite,
+   419→  geometry: RadarGeometry,
+   420→): Raster | { error: string } {
+   421→  const faultRes = faultFromEvent(event);
+   422→  if ('error' in faultRes) return { error: faultRes.error };
+   423→  const epi = projectToGrid(event.lat, event.lon, meta);
+   424→  if ('error' in epi) return { error: epi.error };
+   425→
+   426→  const { fault, centroidDepthM } = faultRes;
+   427→  const los = losUnitVector(
+   428→    geometry.incidenceAngleDeg,
+   429→    geometry.headingDeg,
+   430→    geometry.lookDirection,
+   431→  );
+   432→  const n = meta.width * meta.height;
+   433→  const pred = new Float32Array(n);
+   434→  for (let idx = 0; idx < n; idx++) {
+   435→    const i = Math.floor(idx / meta.width);
+   436→    const j = idx % meta.width;
+   437→    const d = geoFaultDisplacementENU(
+   438→      fault,
+   439→      centroidDepthM,
+   440→      meta.xStart + j * meta.xSpacing - epi.x,
+   441→      meta.yStart + i * meta.ySpacing - epi.y,
+   442→    );
+   443→    pred[idx] = d.singular ? NaN : projectDisplacementToLOS(d, los);
+   444→  }
+   445→  return { meta, data: pred };
+   446→}
+   447→
+   448→/** Helper to attach prediction raster (for the map layer) on a dataset grid. */
+   449→export function buildPredictionRaster(
+   450→  ds: ScienceDataset,
+   451→  event: UsgsEventLite,
+   452→): Raster | undefined {
+   453→  if (!ds.phase) return undefined;
+   454→  const r = buildPredictionOnGrid(ds.phase.meta, event, ds.geometry);
+   455→  return 'error' in r ? undefined : r;
+   456→}
+   457→
+   458→// ---------------------------------------------------------------------------
+   459→// Hypothesis evaluation.
+   460→
+   461→/**
+   462→ * Evaluate hypotheses given the measured summary, dataset geometry and the
+   463→ * (already ranked) USGS event selection.
+   464→ */
+   465→export function evaluateAttribution(
+   466→  ds: ScienceDataset,
+   467→  summary: ChangeSummary,
+   468→  selection: EventSelection,
+   469→  forwardModel?: AttributionOutput['forwardModelCheck'],
+   470→): AttributionOutput {
+   471→  const hyp: Hypothesis[] = [];
+   472→  const events = selection.ranked;
+   473→  const minCredibleAreaKm2 = Math.max(1, summary.pixelAreaKm2 * 4);
+   474→  const detected =
+   475→    summary.affectedAreaKm2 > 0 && summary.affectedAreaKm2 >= minCredibleAreaKm2;
+   476→
+   477→  // ---- H1: coseismic deformation -------------------------------------
+   478→  const ev = selection.primary;
+   479→  const coseismicEvidence: string[] = [];
+   480→  let coseismicStatus: Hypothesis['status'] = 'insufficient-evidence';
+   481→  if (ev) {
+   482→    coseismicEvidence.push(
+   483→      `${events.length} in-window USGS catalog event(s) within ${selection.criteria.maxDistanceKm} km of the footprint ` +
+   484→        `(${ds.provenance.referenceTime.slice(0, 10)} to ${ds.provenance.secondaryTime.slice(0, 10)}); ` +
+   485→        `largest/most relevant: M${Number.isFinite(ev.magnitude) ? ev.magnitude.toFixed(1) : '?'} ${ev.magType ?? ''} ${ev.place} ` +
+   486→        `at ${ev.time.slice(0, 16).replace('T', ' ')} UTC, ${ev.depthKm.toFixed(0)} km deep ` +
+   487→        `(${selection.criteria.ranking.split('.')[0].toLowerCase()}).`,
+   488→    );
+   489→    if (selection.alternatives.length > 0) {
+   490→      coseismicEvidence.push(
+   491→        'Alternative in-window candidates (not selected as primary): ' +
+   492→          selection.alternatives
+   493→            .map((a) => `M${Number.isFinite(a.magnitude) ? a.magnitude.toFixed(1) : '?'} ${a.place} (${a.time.slice(0, 10)})`)
+   494→            .join('; ') +
+   495→          '.',
+   496→      );
+   497→    }
+   498→    if (detected && forwardModel && !forwardModel.skipped) {
+   499→      coseismicEvidence.push(
+   500→        `Okada (1985) forward model from the USGS nodal plane (epicentre-anchored) predicts a peak ` +
+   501→          `LOS displacement of ${(forwardModel.predictedPeakM * 1000).toFixed(0)} mm; the measurement peaks at ` +
+   502→          `${(forwardModel.measuredPeakM * 1000).toFixed(0)} mm (amplitude ratio ` +
+   503→          `${forwardModel.amplitudeRatio.toFixed(2)}).`,
+   504→      );
+   505→      coseismicEvidence.push(
+   506→        `Spatial correlation between the predicted and measured displacement fields: r = ` +
+   507→          `${Number.isNaN(forwardModel.patternCorrelation) ? 'n/a' : forwardModel.patternCorrelation.toFixed(2)}.`,
+   508→      );
+   509→      const ampOk =
+   510→        forwardModel.amplitudeRatio > 1 / ATTRIBUTION_HEURISTICS.amplitudeRatioFactor &&
+   511→        forwardModel.amplitudeRatio < ATTRIBUTION_HEURISTICS.amplitudeRatioFactor;
+   512→      const corrOk = forwardModel.patternCorrelation > ATTRIBUTION_HEURISTICS.patternCorrelation;
+   513→      if (ampOk && corrOk) {
+   514→        coseismicStatus = 'consistent';
+   515→        coseismicEvidence.push(
+   516→          'Amplitude within the exploratory factor-of-3 band and positive spatial correlation: the ' +
+   517→            'measured field is CONSISTENT with elastic dislocation from the catalogued event. ' +
+   518→            'Consistency is not causation — other sources producing a similar pattern cannot be ' +
+   519→            'excluded from a single interferogram.',
+   520→        );
+   521→      } else if (ampOk || corrOk) {
+   522→        coseismicStatus = 'plausible';
+   523→        coseismicEvidence.push(
+   524→          'Only part of the exploratory consistency checks pass; other contributions (afterslip, ' +
+   525→            'atmospheric residuals, unwrapping errors) may also be present.',
+   526→        );
+   527→      } else {
+   528→        coseismicStatus = 'not-supported';
+   529→        coseismicEvidence.push(
+   530→          'Amplitude and pattern do not match the forward model under the exploratory thresholds; ' +
+   531→            'a coseismic origin of the measured signal is not supported (the event may be outside ' +
+   532→            'the coherent footprint, or its true dimensions far from the empirical scaling).',
+   533→        );
+   534→      }
+   535→    } else if (forwardModel && forwardModel.skipped) {
+   536→      coseismicEvidence.push(
+   537→        'Forward-model check skipped: ' + forwardModel.skipReason,
+   538→      );
+   539→    } else if (!detected) {
+   540→      coseismicStatus = 'insufficient-evidence';
+   541→      coseismicEvidence.push(
+   542→        'No change above the detection threshold was measured, so coseismic deformation cannot be ' +
+   543→          'confirmed from this pair. This is NOT evidence that no deformation occurred: the event ' +
+   544→          'may be outside the coherent coverage, its signal may sit below the noise/systematic ' +
+   545→          'floor, or the epicentral area may have decorrelated.',
+   546→      );
+   547→    } else {
+   548→      coseismicStatus = 'insufficient-evidence';
+   549→      coseismicEvidence.push(
+   550→        'Measured change exists but no usable focal mechanism / geometry was available for a ' +
+   551→          'forward-model check; no fault geometry was invented.',
+   552→      );
+   553→    }
+   554→  } else {
+   555→    if (ds.isSynthetic && ds.truth) {
+   556→      // SYNTHETIC FIXTURE with analytic ground truth and no catalog events.
+   557→      // The cause of the signal is fixed by construction, so the catalog-based
+   558→      // screen ("no USGS catalog earthquake near this footprint") would be
+   559→      // actively misleading for an earthquake fixture — it would read as
+   560→      // "this is not an earthquake". State the construction fact instead.
+   561→      // (Fix verified 2026-10-21: final-pass audit finding.)
+   562→      let truthPeakM = 0;
+   563→      const stride = Math.max(1, Math.floor(ds.truth.data.length / 20000));
+   564→      for (let i = 0; i < ds.truth.data.length; i += stride) {
+   565→        const v = ds.truth.data[i];
+   566→        if (Number.isFinite(v) && Math.abs(v) > truthPeakM) truthPeakM = Math.abs(v);
+   567→      }
+   568→      if (truthPeakM > 1e-4) {
+   569→        coseismicStatus = 'supported';
+   570→        coseismicEvidence.push(
+   571→          'Demonstration dataset: the displacement field was GENERATED from a known earthquake ' +
+   572→            `dislocation model (analytic ground truth, peak ${(truthPeakM * 1000).toFixed(0)} mm LOS). ` +
+   573→            'The cause is known by construction — a validation statement, not an attribution inference.',
+   574→          'Catalog-based attribution (USGS event cross-match, forward-model consistency) applies to ' +
+   575→            'real measurements; it is intentionally not exercised on synthetic data.',
+   576→        );
+   577→      } else {
+   578→        coseismicStatus = 'not-supported';
+   579→        coseismicEvidence.push(
+   580→          'Demonstration dataset (null fixture): the ground truth contains zero displacement by ' +
+   581→            'construction, so no coseismic signal exists to attribute. This is a false-alarm control, ' +
+   582→            'not an inference about the Earth.',
+   583→        );
+   584→      }
+   585→    } else if (events.length === 0 && selection.excluded.length > 0) {
+   586→      coseismicEvidence.push(
+   587→        'No USGS catalog earthquake qualified for this pair (excluded candidates and reasons: ' +
+   588→          selection.excluded.map((e) => `${e.id}: ${e.reason}`).join('; ') + ').',
+   589→      );
+   590→    } else {
+   591→      coseismicEvidence.push(
+   592→        'No USGS catalog earthquake of the queried magnitude occurred inside the acquisition window ' +
+   593→          'near this footprint.',
+   594→      );
+   595→    }
+   596→    if (!(ds.isSynthetic && ds.truth)) coseismicStatus = 'not-supported';
+   597→  }
+   598→  hyp.push({
+   599→    id: 'coseismic',
+   600→    label: 'Earthquake (coseismic deformation)',
+   601→    description:
+   602→      'Sudden slip on a fault moves the surface elastically during the time between the two radar acquisitions.',
+   603→    status: coseismicStatus,
+   604→    evidence: coseismicEvidence,
+   605→    discriminatingObservation: ds.isSynthetic
+   606→      ? 'Not applicable — the ground truth is known exactly for this demonstration dataset (compare it ' +
+   607→        'against the ground-truth check in the advanced results).'
+   608→      : 'An independent geodetic or seismic source model of the event, or an interferogram from a ' +
+   609→        'different viewing geometry, would confirm or reject this explanation.',
+   610→  });
+   611→
+   612→  // ---- H2: anthropogenic / slow surface motion ------------------------
+   613→  const anthroEvidence: string[] = [];
+   614→  let anthroStatus: Hypothesis['status'] = 'insufficient-evidence';
+   615→  if (detected) {
+   616→    anthroEvidence.push(
+   617→      `Detected anomaly covers ${summary.affectedAreaKm2.toFixed(0)} km² with peak apparent LOS motion ` +
+   618→        `of ${(summary.maxAwayM * 1000).toFixed(1)} mm away / ${(summary.maxTowardM * 1000).toFixed(1)} mm toward the radar.`,
+   619→    );
+   620→    if (ds.isSynthetic && ds.truth) {
+   621→      anthroEvidence.push(
+   622→        'Demonstration dataset: alternative-cause screening is not meaningful when the cause is ' +
+   623→          'fixed by construction (see the earthquake hypothesis).',
+   624→      );
+   625→    } else if (events.length === 0 && coseismicStatus === 'not-supported') {
+   626→      anthroStatus = 'plausible';
+   627→      anthroEvidence.push(
+   628→        'No catalogued earthquake coincides with the signal, so non-seismic processes ' +
+   629→          '(groundwater withdrawal, compaction, landslides, volcanic or geothermal activity) remain plausible.',
+   630→      );
+   631→    } else {
+   632→      anthroEvidence.push(
+   633→        'A seismic candidate exists; slow anthropogenic processes cannot be excluded from a single pair alone.',
+   634→      );
+   635→    }
+   636→    anthroEvidence.push(
+   637→      'This system does not hold land-use or groundwater data, so it cannot decide between these ' +
+   638→        'sub-mechanisms; it reports them as unresolved.',
+   639→    );
+   640→  } else {
+   641→    anthroEvidence.push(
+   642→      'No change detected above the threshold — slow processes below the detection sensitivity ' +
+   643→        'remain possible and cannot be excluded.',
+   644→    );
+   645→  }
+   646→  hyp.push({
+   647→    id: 'anthropogenic-slow',
+   648→    label: 'Slow surface motion (subsidence / uplift / landslide)',
+   649→    description:
+   650→      'Groundwater extraction, soil compaction, mining, landsliding or volcanic sources move the surface gradually.',
+   651→    status: anthroStatus,
+   652→    evidence: anthroEvidence,
+   653→    discriminatingObservation:
+   654→      'A displacement time series over many acquisitions (trend persistence) plus land-use context ' +
+   655→      'would discriminate subsidence-style processes from episodic events.',
+   656→  });
+   657→
+   658→  // ---- H3: atmospheric / ionospheric residual --------------------------
+   659→  const atmEvidence: string[] = [];
+   660→  let atmStatus: Hypothesis['status'] = 'insufficient-evidence';
+   661→  const peakMm = Math.max(Math.abs(summary.maxAwayM), Math.abs(summary.maxTowardM)) * 1000;
+   662→  if (ds.isSynthetic) {
+   663→    // Synthetic fixtures simulate their own noise + atmospheric ramp; the
+   664→    // real-product correction-status language does not apply to them.
+   665→    atmEvidence.push(
+   666→      'Demonstration dataset: the simulator adds a small smooth atmospheric ramp and ' +
+   667→        'coherence-consistent measurement noise by construction (src/lib/science/fixtures.ts). ' +
+   668→        'No real atmospheric state is involved, so real-world atmospheric screening is not meaningful here.',
+   669→    );
+   670→    if (detected) {
+   671→      atmEvidence.push(
+   672→        'The detected pattern is the known earthquake signal of the fixture; the simulated ramp is a minor add-on.',
+   673→      );
+   674→    } else {
+   675→      atmStatus = 'plausible';
+   676→      atmEvidence.push(
+   677→        'What remains in this null fixture is exactly the simulated noise + ramp — by construction.',
+   678→      );
+   679→    }
+   680→  } else {
+   681→    atmEvidence.push(
+   682→      'The product supplies ionospheric and tropospheric correction layers but does NOT apply them ' +
+   683→        'to the stored phase (ASF NISAR GUNW guide), so atmospheric/ionospheric residuals are ' +
+   684→        'structurally present in every GUNW measurement (Hanssen 2001, chapters 6 and 9).',
+   685→    );
+   686→  }
+   687→  if (!ds.isSynthetic && summary.systematicIonoFloorM > 0) {
+   688→    atmEvidence.push(
+   689→      `The ionospheric systematic floor for this pair is ±${(summary.systematicIonoFloorM * 1000).toFixed(0)} mm ` +
+   690→        `(from the ${summary.ionoFloorBasis === 'variation' ? "supplied screen's own spatial variation" : "screen estimate's uncertainty"}).`,
+   691→    );
+   692→  }
+   693→  if (!ds.isSynthetic) {
+   694→    if (detected) {
+   695→      if (peakMm < ATTRIBUTION_HEURISTICS.atmosphericPeakMm) {
+   696→        atmStatus = 'plausible';
+   697→        atmEvidence.push(
+   698→          `Peak apparent displacement (${peakMm.toFixed(0)} mm) is below the exploratory ` +
+   699→            `${ATTRIBUTION_HEURISTICS.atmosphericPeakMm} mm atmospheric-plausibility value, the order of typical ` +
+   700→            'uncorrected tropospheric residuals; an atmospheric contribution to the whole pattern cannot be excluded.',
+   701→        );
+   702→      } else {
+   703→        atmEvidence.push(
+   704→          `Peak apparent displacement (${peakMm.toFixed(0)} mm) exceeds what residual atmosphere typically ` +
+   705→            'produces; a purely atmospheric origin is unlikely to explain the full amplitude (exploratory judgement).',
+   706→        );
+   707→      }
+   708→    } else {
+   709→      atmStatus = 'plausible';
+   710→      atmEvidence.push(
+   711→        'Sub-threshold spatially smooth variation is exactly what uncorrected atmospheric residuals ' +
+   712→          'look like at this sensitivity.',
+   713→      );
+   714→    }
+   715→  }
+   716→  hyp.push({
+   717→    id: 'atmospheric',
+   718→    label: 'Atmospheric / ionospheric residual',
+   719→    description:
+   720→      'Water-vapour and ionosphere changes between acquisitions imprint apparent phase; the GUNW product does not remove them from the stored data.',
+   721→    status: atmStatus,
+   722→    evidence: atmEvidence,
+   723→    discriminatingObservation:
+   724→      'Comparison with an independent weather model (e.g. ERA5 delays), application of the supplied ' +
+   725→      'ionospheric screen, or a pair from a different time spanning the same area would separate ' +
+   726→      'atmospheric artefacts from real motion.',
+   727→  });
+   728→
+   729→  // ---- H4: unwrapping error --------------------------------------------
+   730→  const unwrapEvidence: string[] = [];
+   731→  let unwrapStatus: Hypothesis['status'] = 'insufficient-evidence';
+   732→  if (summary.connectedComponentCount > 1) {
+   733→    unwrapStatus = 'plausible';
+   734→    unwrapEvidence.push(
+   735→      `${summary.connectedComponentCount} unwrapping connected components hold valid pixels; ` +
+   736→        'phase offsets between components can masquerade as step-like displacement.',
+   737→    );
+   738→  } else {
+   739→    unwrapEvidence.push(
+   740→      'A single unwrapping connected component covers the valid pixels, which lowers the likelihood ' +
+   741→        'of gross inter-region 2π-cycle offsets. This is NOT proof of their absence: cycle errors ' +
+   742→        'can occur within one component, and the unwrapper itself can be misled by low coherence.',
+   743→    );
+   744→  }
+   745→  hyp.push({
+   746→    id: 'unwrapping',
+   747→    label: 'Phase-unwrapping artefact',
+   748→    description:
+   749→      'If the phase unwrapper jumps by whole cycles between regions, apparent displacement steps appear that are not physical.',
+   750→    status: unwrapStatus,
+   751→    evidence: unwrapEvidence,
+   752→    discriminatingObservation:
+   753→      'Re-unwrapping with a different algorithm or inspecting the wrapped phase along the component ' +
+   754→      'boundary would reveal cycle jumps.',
+   755→  });
+   756→
+   757→  // ---- H5: no change above threshold ------------------------------------
+   758→  hyp.push({
+   759→    id: 'null',
+   760→    label: 'No change above the detection threshold',
+   761→    description:
+   762→      'No apparent LOS range change above the configured detection threshold and minimum credible area was found.',
+   763→    status: detected ? 'not-supported' : 'supported',
+   764→    evidence: [
+   765→      detected
+   766→        ? `A credible anomaly (${summary.affectedAreaKm2.toFixed(0)} km² above threshold) was detected.`
+   767→        : 'No pixel exceeded the combined statistical and physical detection threshold (or only ' +
+   768→          'isolated stray pixels below the minimum credible area did).',
+   769→      `Median per-pixel one-sigma uncertainty: ${(summary.medianSigmaM * 1000).toFixed(1)} mm; ` +
+   770→        `detection floor: ${Math.max(summary.systematicIonoFloorM, 0.01) >= 0.01 ? '' : ''}` +
+   771→        `${((summary.systematicIonoFloorM || 0.01) * 1000).toFixed(0)} mm.`,
+   772→      detected
+   773→        ? undefined
+   774→        : 'Supported here means exactly "no detection above threshold at the available sensitivity" — ' +
+   775→          'NOT that the ground did not move.',
+   776→    ].filter((x): x is string => x !== undefined),
+   777→    discriminatingObservation: undefined,
+   778→  });
+   779→
+   780→  // Order: supported/consistent first, then plausible, then insufficient, then not-supported.
+   781→  const rank: Record<Hypothesis['status'], number> = {
+   782→    supported: 0,
+   783→    consistent: 1,
+   784→    plausible: 2,
+   785→    'insufficient-evidence': 3,
+   786→    'not-supported': 4,
+   787→  };
+   788→  hyp.sort((a, b) => rank[a.status] - rank[b.status]);
+   789→
+   790→  return {
+   791→    hypotheses: hyp,
+   792→    events,
+   793→    eventSelection: {
+   794→      criteria: selection.criteria,
+   795→      excluded: selection.excluded,
+   796→      alternatives: selection.alternatives.map((a) => ({ id: a.id, magnitude: a.magnitude, place: a.place, time: a.time })),
+   797→    },
+   798→    forwardModelCheck: forwardModel,
+   799→    heuristics: ATTRIBUTION_HEURISTICS,
+   800→    methodNote:
+   801→      (ds.isSynthetic
+   802→        ? 'Demonstration dataset: hypotheses state construction facts from the known ground truth ' +
+   803→          'rather than screening outcomes; catalog-based attribution is not exercised on synthetic data. '
+   804→        : '') +
+   805→      'Rule-based, evidence-linked screening. Forward-model checks use the Okada (1985) elastic ' +
+   806→      'half-space with the USGS moment-tensor nodal plane anchored at the projected epicentre, ' +
+   807→      'Wells & Coppersmith (1994) area scaling and Hanks & Kanamori (1979) moment-magnitude ' +
+   808→      'relation. ' + HEURISTICS_NOTE,
+   809→  };
+   810→}
+   811→
