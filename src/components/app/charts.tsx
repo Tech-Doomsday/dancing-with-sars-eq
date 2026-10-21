@@ -593,3 +593,346 @@ export function WhyCantISeeAnything({ summary }: { summary: AnalysisResult['summ
     </div>
   );
 }
+
+/* ================================================================== */
+/* SBAS time-series stack charts (system plan §6/§8/§11)               */
+/* ================================================================== */
+
+import type { KeySeries, SbasResult, AnomalyAttribution } from '@/lib/science/types';
+import { Zap, Sigma, GitBranch, Landmark, Radar, LineChart as LineChartIcon } from 'lucide-react';
+
+/** Multi-series cumulative-displacement chart with σ bands and PELT marks. */
+export function SbasSeriesChart({ series }: { series: KeySeries[] }) {
+  const [selected, setSelected] = useState<string>(series[0]?.id ?? '');
+  const active = series.find((s) => s.id === selected) ?? series[0];
+  if (!active) return null;
+
+  const times = active.times.map((t) => new Date(t).getTime());
+  const t0 = times[0];
+  const xDays = times.map((t) => (t - t0) / 86400000);
+  const allVals = series.flatMap((s) => s.displacementM.filter(Number.isFinite));
+  const vMax = Math.max(...allVals.map(Math.abs), 0.02);
+
+  // Chart geometry.
+  const W = 560;
+  const H = 190;
+  const padL = 46;
+  const padR = 14;
+  const padT = 12;
+  const padB = 30;
+  const xMax = Math.max(...xDays, 1);
+  const x = (d: number) => padL + (d / xMax) * (W - padL - padR);
+  const y = (v: number) => padT + (1 - (v + vMax) / (2 * vMax)) * (H - padT - padB);
+
+  const colors: Record<string, string> = {
+    'quake-step': '#C05621',
+    'subsidence-peak': '#815A9B',
+    'basin-bowl': '#6B8E5A',
+    'toward-peak': '#3F7F93',
+    'anomaly-centroid': '#B08D57',
+    'stable-reference': '#8A837B',
+  };
+
+  // Y ticks (mm).
+  const tickVals = [-vMax, -vMax / 2, 0, vMax / 2, vMax].filter((v) => Math.abs(v) > 1e-9 || v === 0);
+  const mm = (v: number) => `${(v * 1000).toFixed(0)}`;
+
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap gap-1.5">
+        {series.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => setSelected(s.id)}
+            aria-pressed={s.id === selected}
+            className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors ${
+              s.id === selected
+                ? 'border-[#B08D57] bg-[#F7EBD9] font-semibold text-[#7A6438]'
+                : 'border-[#E7E2DA] bg-white text-[#6F6862] hover:bg-[#F7F4EE]'
+            }`}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+      <motion.svg
+        key={active.id}
+        viewBox={`0 0 ${W} ${H}`}
+        className="h-auto w-full"
+        role="img"
+        aria-label={`Cumulative LOS displacement at ${active.label}`}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 0.35 }}
+      >
+        {/* Grid + axes */}
+        {tickVals.map((v) => (
+          <g key={v}>
+            <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#EFEAE2" strokeWidth={1} />
+            <text x={padL - 6} y={y(v) + 3.5} textAnchor="end" fontSize={9.5} fill="#8A837B">
+              {mm(v)}
+            </text>
+          </g>
+        ))}
+        <line x1={padL} x2={W - padR} y1={y(0)} y2={y(0)} stroke="#D8D2C6" strokeWidth={1.2} />
+        {[0, 0.25, 0.5, 0.75, 1].map((f) => {
+          const d = f * xMax;
+          const date = new Date(t0 + d * 86400000);
+          return (
+            <text key={f} x={x(d)} y={H - 10} textAnchor="middle" fontSize={9.5} fill="#8A837B">
+              {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+            </text>
+          );
+        })}
+        <text x={10} y={padT + 4} fontSize={9.5} fill="#8A837B">
+          mm
+        </text>
+
+        {/* σ band */}
+        {active.sigmaM.some((s) => s > 0) && (
+          <path
+            d={
+              active.displacementM
+                .map((v, i) => `${i === 0 ? 'M' : 'L'}${x(xDays[i])},${y(v + active.sigmaM[i])}`)
+                .join(' ') +
+              ' ' +
+              active.displacementM
+                .map((v, i) => `L${x(xDays[active.displacementM.length - 1 - i])},${y(
+                  active.displacementM[active.displacementM.length - 1 - i] -
+                    active.sigmaM[active.displacementM.length - 1 - i],
+                )}`)
+                .join(' ') +
+              ' Z'
+            }
+            fill="#B08D57"
+            opacity={0.13}
+          />
+        )}
+
+        {/* Series line */}
+        <motion.path
+          d={active.displacementM
+            .map((v, i) => `${i === 0 ? 'M' : 'L'}${x(xDays[i])},${y(v)}`)
+            .join(' ')}
+          fill="none"
+          stroke={colors[active.id] ?? '#7A6438'}
+          strokeWidth={2}
+          strokeLinejoin="round"
+          initial={{ pathLength: 0 }}
+          animate={{ pathLength: 1 }}
+          transition={{ duration: 0.9, ease: 'easeOut' }}
+        />
+
+        {/* PELT change points */}
+        {active.changePoints
+          .filter((c) => Math.abs(c.stepM) > 0.015)
+          .map((c) => {
+            const cp = c.afterEpochIndex;
+            const cx = x(xDays[Math.min(cp, xDays.length - 1)]);
+            return (
+              <g key={cp}>
+                <line x1={cx} x2={cx} y1={padT} y2={H - padB} stroke="#C05621" strokeWidth={1.4} strokeDasharray="4 3" />
+                <circle cx={cx} cy={y(active.displacementM[Math.min(cp, active.displacementM.length - 1)])} r={4} fill="#C05621" />
+                <text x={cx + 5} y={padT + 10} fontSize={9.5} fill="#C05621" fontWeight={600}>
+                  {(Math.abs(c.stepM) * 1000).toFixed(0)} mm
+                </text>
+              </g>
+            );
+          })}
+
+        {/* End-point dot */}
+        <circle
+          cx={x(xDays[xDays.length - 1])}
+          cy={y(active.displacementM[active.displacementM.length - 1])}
+          r={3.5}
+          fill={colors[active.id] ?? '#7A6438'}
+        />
+      </motion.svg>
+      <p className="mt-2 text-[11.5px] leading-4 text-[#6F6862]">
+        {active.note} Velocity from the linear fit:{' '}
+        <strong className="font-semibold text-[#1C1A17]">{(active.velocityMPerYr * 1000).toFixed(0)} mm/yr</strong>{' '}
+        (trend R² {active.linearR2.toFixed(2)}); shaded band = 1σ per epoch; dashed marks = PELT-isolated
+        transients (plan §7).
+      </p>
+    </div>
+  );
+}
+
+/** Bayesian posterior bars with entropy + Bayes factor (plan §8 Stage 6). */
+export function PosteriorBars({ anomaly }: { anomaly: AnomalyAttribution }) {
+  const classes: Array<{ key: 'quake' | 'subsid' | 'slide'; label: string; color: string }> = [
+    { key: 'quake', label: 'Coseismic (Okada H1)', color: '#C05621' },
+    { key: 'subsid', label: 'Aquifer compaction (H2)', color: '#6B8E5A' },
+    { key: 'slide', label: 'Slope instability (H3)', color: '#3F7F93' },
+  ];
+  const assigned = anomaly.bayes.assignedState !== 'UNATTRIBUTED_INSUFFICIENT_EVIDENCE';
+  return (
+    <div className="rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-3.5">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-[12.5px] font-semibold text-[#1C1A17]">{anomaly.label}</p>
+        <span
+          className={`rounded-full px-2 py-0.5 text-[10.5px] font-semibold ${
+            assigned ? 'bg-[#E8F0E4] text-[#4A6B3A]' : 'bg-[#F7EBD9] text-[#8F6A2B]'
+          }`}
+        >
+          {assigned ? anomaly.bayes.assignedState.replace('PRIMARY_CAUSE_', '') : 'UNATTRIBUTED — INSUFFICIENT EVIDENCE'}
+        </span>
+      </div>
+      <p className="mt-1 text-[11px] text-[#8A837B]">
+        {anomaly.areaKm2.toFixed(0)} km² · peak {(Math.abs(anomaly.peakVelocityMPerYr) * 1000).toFixed(0)} mm/yr
+        {anomaly.id.startsWith('step-') ? ' (step amplitude)' : ''}
+      </p>
+      <div className="mt-2.5 space-y-1.5">
+        {classes.map((c, i) => {
+          const p = anomaly.bayes.posteriors[c.key];
+          return (
+            <div key={c.key} className="flex items-center gap-2">
+              <span className="w-40 shrink-0 text-right text-[10.5px] text-[#6F6862]">{c.label}</span>
+              <div className="h-4 flex-1 overflow-hidden rounded bg-[#F1EDE5]">
+                <motion.div
+                  className="h-full rounded"
+                  style={{ background: c.color }}
+                  initial={{ width: 0 }}
+                  animate={{ width: `${Math.max(p * 100, p > 0.005 ? 1.5 : 0)}%` }}
+                  transition={{ duration: 0.5, delay: i * 0.1 }}
+                />
+              </div>
+              <span className="w-10 text-[10.5px] font-semibold text-[#1C1A17]">{(p * 100).toFixed(0)}%</span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[10.5px] text-[#8A837B]">
+        <span>
+          Shannon entropy <strong className="font-semibold text-[#4A443C]">{anomaly.bayes.entropy.toFixed(2)}</strong>{' '}
+          (abstain &gt; 0.75)
+        </span>
+        <span>
+          Bayes factor <strong className="font-semibold text-[#4A443C]">{anomaly.bayes.bayesFactor.toFixed(1)}</strong>
+        </span>
+        <span>
+          gradient {anomaly.features.gradS.toFixed(3)} m/km · linearity {anomaly.features.tempLinearity.toFixed(2)}
+        </span>
+      </div>
+      <ul className="mt-2 list-disc space-y-0.5 pl-4 text-[11px] leading-4 text-[#6F6862]">
+        {anomaly.bayes.evidence.slice(0, 4).map((e, i) => (
+          <li key={i}>{e}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** GNSS validation scatter + metrics (plan §11). */
+export function GnssValidationCard({ gnss }: { gnss: SbasResult['gnss'] }) {
+  if (gnss.stations.length === 0) {
+    return (
+      <p className="text-[12px] text-[#6F6862]">No GNSS stations fell inside the valid coverage for comparison.</p>
+    );
+  }
+  const vals = gnss.stations.flatMap((s) => [s.gnssLosMmPerYr, s.insarLosMmPerYr]);
+  const m = Math.max(...vals.map(Math.abs), 50) * 1.15;
+  const W = 300;
+  const H = 300;
+  const pad = 34;
+  const x = (v: number) => pad + ((v + m) / (2 * m)) * (W - 2 * pad);
+  const y = (v: number) => H - pad - ((v + m) / (2 * m)) * (H - 2 * pad);
+  return (
+    <div className="grid gap-4 sm:grid-cols-[300px_1fr] sm:items-center">
+      <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="InSAR vs GNSS LOS velocity scatter" className="h-auto w-full max-w-[300px]">
+        <rect x={pad} y={pad} width={W - 2 * pad} height={H - 2 * pad} fill="#FDFCF9" stroke="#EFEAE2" />
+        {[0.25, 0.5, 0.75].map((f) => (
+          <g key={f}>
+            <line x1={pad + f * (W - 2 * pad)} x2={pad + f * (W - 2 * pad)} y1={pad} y2={H - pad} stroke="#F1EDE5" />
+            <line x1={pad} x2={W - pad} y1={pad + f * (H - 2 * pad)} y2={pad + f * (H - 2 * pad)} stroke="#F1EDE5" />
+          </g>
+        ))}
+        <line x1={x(-m)} y1={y(-m)} x2={x(m)} y2={y(m)} stroke="#B08D57" strokeWidth={1.2} strokeDasharray="5 4" />
+        {gnss.stations.map((s) => (
+          <motion.circle
+            key={s.stationId}
+            cx={x(s.gnssLosMmPerYr)}
+            cy={y(s.insarLosMmPerYr)}
+            r={4.5}
+            fill="#6B8E5A"
+            stroke="#2F4823"
+            strokeWidth={1}
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{ type: 'spring', stiffness: 300, damping: 18 }}
+          >
+            <title>{s.stationId}: GNSS {s.gnssLosMmPerYr.toFixed(1)} vs InSAR {s.insarLosMmPerYr.toFixed(1)} mm/yr</title>
+          </motion.circle>
+        ))}
+        <text x={W / 2} y={H - 8} textAnchor="middle" fontSize={10} fill="#8A837B">
+          GNSS LOS velocity (mm/yr)
+        </text>
+        <text x={10} y={H / 2} fontSize={10} fill="#8A837B" transform={`rotate(-90 10 ${H / 2})`} textAnchor="middle">
+          InSAR LOS velocity (mm/yr)
+        </text>
+      </svg>
+      <div>
+        <div className="grid grid-cols-3 gap-2">
+          {[
+            { label: 'RMSE', value: `${gnss.rmseMmPerYr.toFixed(1)} mm/yr` },
+            { label: 'Bias', value: `${gnss.biasMmPerYr >= 0 ? '+' : ''}${gnss.biasMmPerYr.toFixed(1)} mm/yr` },
+            { label: 'Stations', value: `${gnss.n}` },
+          ].map((s) => (
+            <div key={s.label} className="rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-2 text-center">
+              <p className="text-[10px] uppercase tracking-wide text-[#8A837B]">{s.label}</p>
+              <p className="mt-0.5 text-[14px] font-semibold text-[#1C1A17]">{s.value}</p>
+            </div>
+          ))}
+        </div>
+        <p className="mt-2 text-[11px] leading-4 text-[#6F6862]">{gnss.note}</p>
+      </div>
+    </div>
+  );
+}
+
+/** Phase-budget / corrections ledger (plan §6). */
+export function CorrectionsLedger({ corrections }: { corrections: SbasResult['corrections'] }) {
+  return (
+    <div className="space-y-2">
+      {corrections.entries.map((e, i) => (
+        <motion.div
+          key={e.key}
+          initial={{ opacity: 0, x: -8 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ delay: i * 0.08 }}
+          className="flex items-start gap-3 rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-2.5"
+        >
+          <span
+            className={`mt-0.5 h-2 w-2 shrink-0 rounded-full ${e.key === 'turbulent-troposphere' ? 'bg-[#C05621]' : 'bg-[#6B8E5A]'}`}
+            aria-hidden
+          />
+          <div>
+            <p className="text-[12px] font-medium text-[#1C1A17]">
+              {e.label} — <strong className="font-semibold">±{(e.rmsM * 1000).toFixed(1)} mm</strong>
+            </p>
+            <p className="mt-0.5 text-[11px] leading-4 text-[#6F6862]">{e.note}</p>
+          </div>
+        </motion.div>
+      ))}
+      <p className="text-[11px] leading-4 text-[#8A837B]">{corrections.methodNote}</p>
+    </div>
+  );
+}
+
+/** Epoch slider row (the time-change viewer controls live in the map card). */
+export function EpochSliderNote({ count }: { count: number }) {
+  return (
+    <p className="flex items-center gap-1.5 text-[11px] text-[#8A837B]">
+      <LineChartIcon className="h-3.5 w-3.5" aria-hidden />
+      Drag the epoch slider on the map to scrub through {count} acquisitions of cumulative displacement —
+      watch the subsidence bowls grow and the coseismic step appear at the event epoch.
+    </p>
+  );
+}
+
+void Zap;
+void Sigma;
+void GitBranch;
+void Landmark;
+void Radar;

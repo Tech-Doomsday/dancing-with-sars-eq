@@ -23,7 +23,7 @@ export interface GridGeo {
   lonMax: number;
 }
 
-export type LayerKind = 'displacement' | 'coherence' | 'sigma' | 'coverage';
+export type LayerKind = 'velocity' | 'displacement' | 'coherence' | 'sigma' | 'coverage';
 
 export interface RenderedOverlay {
   dataUrl: string;
@@ -108,7 +108,7 @@ export function renderOverlay(
 
   // Scale factors.
   let scaleMax: number | undefined;
-  if (layer === 'displacement') {
+  if (layer === 'displacement' || layer === 'velocity') {
     let absMax = 0;
     for (let i = 0; i < grids.displacement.length; i++) {
       if (grids.mask[i]) {
@@ -171,7 +171,7 @@ export function renderOverlay(
         continue;
       }
       let css: string;
-      if (layer === 'displacement') {
+      if (layer === 'displacement' || layer === 'velocity') {
         const v = grids.displacement[gi];
         if (!Number.isFinite(v)) {
           img.data[idx + 3] = 0;

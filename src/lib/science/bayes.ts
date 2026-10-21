@@ -92,7 +92,11 @@ export function causalLikelihoods(
   let lSubsid = pGradSubsid * linearity;
 
   // H3 slope instability: gradient magnitude × topographic correlation.
-  let lSlide = Math.max(0, gradS) * Math.max(-1, Math.min(1, f.demCorr));
+  // A non-finite demCorr (not computable — e.g. step-field anomalies) is
+  // NEUTRAL (0): Math.min/max with NaN propagates NaN through the whole
+  // posterior and collapses it to the degenerate uniform branch.
+  const demCorr = Number.isFinite(f.demCorr) ? f.demCorr : 0;
+  let lSlide = Math.max(0, gradS) * Math.max(-1, Math.min(1, demCorr));
 
   // Stage 4 forward-model residuals, when available, multiply the matching
   // hypothesis likelihood by exp(−rmse²/2σ²) (a Gaussian consistency term).
@@ -114,7 +118,7 @@ export function causalLikelihoods(
   // Polarimetric cross-ratio shift (plan §8 Stage 3, fourth feature): a
   // surface-change signature (moisture/land-cover) argues AGAINST a purely
   // mechanical cause; absent GCOV data leaves the term neutral at 1.
-  if (Number.isFinite(f.polShift) && f.polShift !== 0) {
+  if (f.polShift !== undefined && Number.isFinite(f.polShift) && f.polShift !== 0) {
     const w = Math.max(0, Math.min(0.5, Math.abs(f.polShift)));
     lQuake *= 1 - 0.5 * w;
     lSubsid *= 1 - 0.5 * w;

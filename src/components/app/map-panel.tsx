@@ -104,7 +104,11 @@ function HoverReadout({
   let value = '—';
   let label = '';
   if (sample) {
-    if (layer === 'displacement' || layer === 'coverage') {
+    if (layer === 'velocity') {
+      const mmYr = sample.displacement * 1000;
+      value = `${mmYr >= 0 ? '+' : ''}${mmYr.toFixed(1)} mm/yr`;
+      label = mmYr >= 0 ? 'moving away from satellite' : 'moving toward satellite';
+    } else if (layer === 'displacement' || layer === 'coverage') {
       const mm = sample.displacement * 1000;
       value = `${Math.abs(mm).toFixed(1)} mm`;
       label = mm >= 0 ? 'away from satellite' : 'toward satellite';
@@ -143,27 +147,34 @@ function Legend({ layer, scaleMaxM }: { layer: LayerKind; scaleMaxM?: number }) 
       </div>
     );
   }
+  const isVel = layer === 'velocity';
   const gradient =
-    layer === 'displacement'
+    layer === 'displacement' || isVel
       ? `linear-gradient(to right, ${displacementColor(-1)}, ${displacementColor(-0.34)}, ${displacementColor(0)}, ${displacementColor(0.34)}, ${displacementColor(1)})`
       : layer === 'coherence'
         ? `linear-gradient(to right, #F5F1E8, #CBC3B5, #8A837A, #4A443C)`
         : `linear-gradient(to right, #F5F1E8, #E2C7AC, #B0714E, #7A4A2B)`;
   const left =
-    layer === 'displacement'
-      ? `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm toward`
+    layer === 'displacement' || isVel
+      ? isVel
+        ? `${((scaleMaxM ?? 0.05) * 1000).toFixed(0)} mm/yr toward`
+        : `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm toward`
       : layer === 'coherence'
         ? 'weak signal'
         : 'low';
   const right =
-    layer === 'displacement'
-      ? `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm away`
+    layer === 'displacement' || isVel
+      ? isVel
+        ? `${((scaleMaxM ?? 0.05) * 1000).toFixed(0)} mm/yr away`
+        : `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm away`
       : layer === 'coherence'
         ? 'strong signal'
         : 'high';
   const title =
-    layer === 'displacement'
-      ? 'Movement toward / away from the satellite'
+    layer === 'displacement' || isVel
+      ? isVel
+        ? 'LOS velocity (sustained motion)'
+        : 'Movement toward / away from the satellite'
       : layer === 'coherence'
         ? 'Signal quality (coherence)'
         : 'Measurement uncertainty';
@@ -176,8 +187,10 @@ function Legend({ layer, scaleMaxM }: { layer: LayerKind; scaleMaxM?: number }) 
         <span className="font-mono text-[10px] text-[#6F6862]">{right}</span>
       </div>
       <div className="mt-1 text-[10px] text-[#8A837B]">
-        {layer === 'displacement'
-          ? 'brown = toward the satellite · green = away from it · pale = little or no change'
+        {layer === 'displacement' || isVel
+          ? isVel
+            ? 'brown = moving toward the satellite · green = away from it (subsidence convention) · pale = stable'
+            : 'brown = toward the satellite · green = away from it · pale = little or no change'
           : layer === 'coherence'
             ? 'darker = more reliable measurement'
             : 'darker = more uncertain measurement'}

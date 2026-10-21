@@ -273,9 +273,26 @@ export function solveSbasPixel(
       for (let j = a; j < b; j++) A0[i * n + j] += w[k] * sInv[i] * sInv[j];
     }
   }
-  let A = A0;
+  // Weak prior on the interval DISPLACEMENT u_j·Δt_j ~ N(0, σ_d²) with
+  // σ_d = 100 mm — a deliberately loose bound on the ground motion accrued
+  // within one 12-day interval (beyond it, an interferogram would be fully
+  // decorrelated/aliased anyway). Expressed on the rate variable u_j the
+  // prior weight is
+  //   priorW_j = sInv_j² / σ_d²,
+  // which is COMMENSURATE with the data weight w·sInv_j² on u_j (both scale
+  // with sInv²). With typical per-ifg σ ≈ 5–15 mm the prior contributes only
+  // a few percent of shrinkage on OBSERVED intervals, while guaranteeing A
+  // is positive definite when an interval has no observations (missing
+  // interferograms): the solution there is pinned to 0 with the honest
+  // displacement-scale uncertainty instead of exploding.
+  const PRIOR_SIGMA_DISPLACEMENT_M = 0.1;
+  const priorW = new Float64Array(n);
+  for (let j = 0; j < n; j++) {
+    priorW[j] = (sInv[j] * sInv[j]) / (PRIOR_SIGMA_DISPLACEMENT_M * PRIOR_SIGMA_DISPLACEMENT_M);
+  }
+  let A = A0.slice();
+  for (let j = 0; j < n; j++) A[j * n + j] += priorW[j];
   if (opts.lambda > 0) {
-    A = A0.slice();
     // λ² DᵀD with D the first-difference operator on u (m/yr).
     const l2 = opts.lambda * opts.lambda;
     for (let j = 0; j < n - 1; j++) {
@@ -286,21 +303,13 @@ export function solveSbasPixel(
     }
   }
 
-  // Factor (with jitter retry) and solve.
-  let fact = A.slice();
+  // Factor and solve (PD by construction of the prior).
+  const fact = A;
   if (!choleskyInPlace(fact, n)) {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      fact = A.slice();
-      const jitter = Math.pow(10, -6 + attempt) * (A[0] || 1);
-      for (let i = 0; i < n; i++) fact[i * n + i] += jitter;
-      if (choleskyInPlace(fact, n)) break;
-      if (attempt === 3) {
-        return {
-          v: null, temporalCoherence: 0, residualRmsM: NaN, meanVelocityMPerYr: NaN,
-          sigmaVelocityMPerYr: NaN, cumulative: null, cumulativeSigma: null, usedIfgs: used,
-        };
-      }
-    }
+    return {
+      v: null, temporalCoherence: 0, residualRmsM: NaN, meanVelocityMPerYr: NaN,
+      sigmaVelocityMPerYr: NaN, cumulative: null, cumulativeSigma: null, usedIfgs: used,
+    };
   }
   const u = choleskySolve(fact, n, c); // interval velocities, m/yr
 
@@ -338,14 +347,10 @@ export function solveSbasPixel(
   // UNREGULARIZED precision BᵀWB when it is factorizable (the Tikhonov term
   // shrinks variance artificially). Fall back to the regularized matrix.
   let sigmaVy = NaN;
-  // A0 (built above) IS the unregularized precision matrix BᵀWB.
-  let fu = A0.slice();
-  if (!choleskyInPlace(fu, n)) {
-    fu = A.slice();
-    for (let i = 0; i < n; i++) fu[i * n + i] += 1e-9 * (fu[0] || 1);
-    if (!choleskyInPlace(fu, n)) fu = null;
-  }
-  if (fu) {
+  // Precision of the solved (unregularized + prior) system: A0 + diag(priorW).
+  const fu: Float64Array | null = A0;
+  for (let j = 0; j < n; j++) fu[j * n + j] += priorW[j];
+  if (choleskyInPlace(fu, n)) {
     // mean velocity (m/yr) = (Σ u_j·Δt_j) / T_days — a linear functional
     // aᵀu with a_j = Δt_j/T·… ; Var = aᵀ A0⁻¹ a with everything in m/yr.
     const a = new Float64Array(n);
@@ -358,7 +363,7 @@ export function solveSbasPixel(
   // Cumulative sigma per epoch (same inverse, subset sums) — optional because
   // it costs O(N) Cholesky solves per pixel and is only needed at key points.
   let cumulativeSigma: Float64Array | null = null;
-  if (fu && opts.wantCumulativeSigma) {
+  if (fu !== null && opts.wantCumulativeSigma) {
     cumulativeSigma = new Float64Array(n + 1);
     const e = new Float64Array(n);
     for (let ep = 1; ep <= n; ep++) {
@@ -380,6 +385,168 @@ export function solveSbasPixel(
     cumulative,
     cumulativeSigma,
     usedIfgs: used,
+  };
+}
+
+/**
+ * Step-augmented SBAS solve for ONE pixel: the parameter vector is extended
+ * with a coseismic step s occurring between epoch `stepInterval` and
+ * `stepInterval + 1`. Interferogram k observes the step iff its span
+ * contains that boundary:
+ *
+ *     d_k = Σ_j B[k,j]·Δt_j/365.25·u_j + s·1[a_k ≤ stepInterval < b_k]
+ *
+ * The step parameter carries a loose prior (σ = 0.5 m — anything beyond is
+ * un-observable by a single interferogram anyway). The returned mean
+ * velocity EXCLUDES the step (secular rate), and `cumulative` INCLUDES it.
+ *
+ * This is the plan's §7 integration of PELT change-point isolation with the
+ * SBAS inversion: a pixel whose smooth-velocity fit fails the temporal
+ * coherence gate is refit with the detected step, so coseismic zones are
+ * modelled rather than masked.
+ */
+export function solveSbasPixelStep(
+  phaseRad: Float64Array | ArrayLike<number>,
+  coherence: Float64Array | ArrayLike<number>,
+  design: SbasDesign,
+  stepInterval: number,
+  opts: SbasSolveOptions,
+): PixelSolve & { stepM: number } {
+  const { m, intervals, spans, intervalDays } = design;
+  const n = intervals;
+  const N = n + 1; // + step parameter
+  const sInv = new Float64Array(n);
+  for (let j = 0; j < n; j++) sInv[j] = intervalDays[j] / 365.25;
+  const mRadInv2 = 1 / (opts.metresPerRad * opts.metresPerRad);
+  const extra2 = (opts.extraSigmaM ?? 0) ** 2;
+
+  const w = new Float64Array(m);
+  const dObs = new Float64Array(m);
+  const hasStep = new Uint8Array(m);
+  let used = 0;
+  for (let k = 0; k < m; k++) {
+    const g = coherence[k];
+    const p = phaseRad[k];
+    if (!Number.isFinite(g) || !Number.isFinite(p)) continue;
+    const wc = coherenceWeight(g, opts.looks) * mRadInv2;
+    w[k] = extra2 > 0 ? 1 / (1 / wc + extra2) : wc;
+    dObs[k] = opts.metresPerRad * p;
+    if (spans[k].a <= stepInterval && stepInterval < spans[k].b) hasStep[k] = 1;
+    used++;
+  }
+  if (used < Math.max(2, 1)) {
+    return {
+      v: null, temporalCoherence: 0, residualRmsM: NaN, meanVelocityMPerYr: NaN,
+      sigmaVelocityMPerYr: NaN, cumulative: null, cumulativeSigma: null, usedIfgs: used, stepM: 0,
+    };
+  }
+
+  // Normal equations in [u (m/yr), s (m)].
+  const A = new Float64Array(N * N);
+  const c = new Float64Array(N);
+  for (let k = 0; k < m; k++) {
+    if (w[k] === 0) continue;
+    const { a, b } = spans[k];
+    for (let i = a; i < b; i++) {
+      c[i] += w[k] * dObs[k] * sInv[i];
+      for (let j = a; j < b; j++) A[i * N + j] += w[k] * sInv[i] * sInv[j];
+      if (hasStep[k]) {
+        A[i * N + n] += w[k] * sInv[i];
+        A[n * N + i] += w[k] * sInv[i];
+      }
+    }
+    if (hasStep[k]) {
+      A[n * N + n] += w[k];
+      c[n] += w[k] * dObs[k];
+    }
+  }
+  // Priors: displacement-bounded on intervals; loose on the step.
+  const PRIOR_D = 0.1;
+  for (let j = 0; j < n; j++) A[j * N + j] += (sInv[j] * sInv[j]) / (PRIOR_D * PRIOR_D);
+  A[n * N + n] += 1 / (0.5 * 0.5);
+  if (opts.lambda > 0) {
+    const l2 = opts.lambda * opts.lambda;
+    for (let j = 0; j < n - 1; j++) {
+      A[j * N + j] += l2 + l2;
+      A[(j + 1) * N + j + 1] += l2;
+      A[j * N + j + 1] -= l2;
+      A[(j + 1) * N + j] -= l2;
+    }
+  }
+  const fact = A;
+  if (!choleskyInPlace(fact, N)) {
+    return {
+      v: null, temporalCoherence: 0, residualRmsM: NaN, meanVelocityMPerYr: NaN,
+      sigmaVelocityMPerYr: NaN, cumulative: null, cumulativeSigma: null, usedIfgs: used, stepM: 0,
+    };
+  }
+  const x = choleskySolve(fact, N, c);
+  const u = x.subarray(0, n);
+  const stepM = x[n];
+
+  // Residuals + temporal coherence.
+  let cosSum = 0;
+  let sinSum = 0;
+  let res2 = 0;
+  let wSum = 0;
+  for (let k = 0; k < m; k++) {
+    if (w[k] === 0) continue;
+    let model = 0;
+    const { a, b } = spans[k];
+    for (let j = a; j < b; j++) model += u[j] * sInv[j];
+    if (hasStep[k]) model += stepM;
+    const resRad = (dObs[k] - model) / opts.metresPerRad;
+    cosSum += Math.cos(resRad);
+    sinSum += Math.sin(resRad);
+    res2 += w[k] * (dObs[k] - model) ** 2;
+    wSum += w[k];
+  }
+  const temporalCoherence = Math.hypot(cosSum, sinSum) / used;
+  const residualRmsM = wSum > 0 ? Math.sqrt(res2 / wSum) : NaN;
+
+  const cumulative = new Float64Array(n + 1);
+  let totalDays = 0;
+  for (let j = 0; j < n; j++) {
+    cumulative[j + 1] = cumulative[j] + u[j] * sInv[j] + (j === stepInterval ? stepM : 0);
+    totalDays += intervalDays[j];
+  }
+  const meanV = totalDays > 0 ? cumulative[n] / totalDays : NaN;
+  // Secular mean velocity excludes the step:
+  const secularTotal = cumulative[n] - stepM;
+  const meanVy = totalDays > 0 ? (secularTotal / totalDays) * 365.25 : NaN;
+
+  // Velocity sigma from the unregularized precision (approximation: reuse
+  // the interval block of the factorized matrix without the step coupling —
+  // slightly optimistic, documented).
+  let sigmaVy = NaN;
+  {
+    const A0 = new Float64Array(n * n);
+    for (let k = 0; k < m; k++) {
+      if (w[k] === 0) continue;
+      const { a, b } = spans[k];
+      for (let i = a; i < b; i++) for (let j = a; j < b; j++) A0[i * n + j] += w[k] * sInv[i] * sInv[j];
+    }
+    for (let j = 0; j < n; j++) A0[j * n + j] += (sInv[j] * sInv[j]) / (PRIOR_D * PRIOR_D);
+    if (choleskyInPlace(A0, n)) {
+      const a = new Float64Array(n);
+      for (let j = 0; j < n; j++) a[j] = intervalDays[j] / totalDays;
+      const invA = choleskySolve(A0, n, a);
+      let varSum = 0;
+      for (let j = 0; j < n; j++) varSum += a[j] * invA[j];
+      if (varSum > 0) sigmaVy = Math.sqrt(varSum);
+    }
+  }
+
+  return {
+    v: new Float64Array(u),
+    temporalCoherence,
+    residualRmsM,
+    meanVelocityMPerYr: meanVy,
+    sigmaVelocityMPerYr: sigmaVy,
+    cumulative,
+    cumulativeSigma: null,
+    usedIfgs: used,
+    stepM,
   };
 }
 
@@ -448,16 +615,17 @@ export function selectLambdaLCurve(
   if (curve.length === 0) return { lambda: 0, curve, criterion: 'no solvable pixels' };
   if (curve.length < 3) return { lambda: curve[Math.min(1, curve.length - 1)].lambda, curve, criterion: 'grid too short' };
 
-  // λ selection — Morozov discrepancy principle on the L-curve: with correct
-  // observation variances, the weighted residual sum has expectation
-  // E[Σ_k w_k r_k²] = m (one unit of χ² per observation). We pick the
-  // SMALLEST λ whose mean residual norm reaches √m: below it the solution is
-  // fitting noise (residual below its own noise level); above it the residual
-  // is dominated by regularization bias, which smears real transients
-  // (coseismic steps) across neighbouring intervals. A pure geometric corner
-  // rule (max distance from the chord) is reported alongside for comparison
-  // but is unstable when the stack contains transient signals.
-  const target = Math.sqrt(design.m);
+  // λ selection — Morozov discrepancy principle on the L-curve, DEGREES-OF-
+  // FREEDOM AWARE: with correct observation variances the weighted residual
+  // sum of the UNREGULARIZED fit has expectation E[Σ_k w_k r_k²] = m − n
+  // (the model's degrees of freedom: m observations, n interval parameters).
+  // We pick the SMALLEST λ whose mean residual norm reaches √(m − n):
+  // below it the solution is fitting noise; above it the residual is
+  // dominated by regularization bias, which smears real transients
+  // (coseismic steps) across neighbouring intervals. (Using √m instead
+  // would demand residuals larger than the unregularized fit can ever
+  // produce and push λ to the grid maximum — over-smoothing everything.)
+  const target = Math.sqrt(Math.max(1, design.m - design.intervals));
   let chosen = curve[0];
   for (const pt of curve) {
     if (pt.residualNorm >= target) {
@@ -481,6 +649,8 @@ export function selectLambdaLCurve(
  * Stack-level inversion — blockwise over the raster (plan §12 memory rule).
  * ========================================================================= */
 
+import { peltChangePoints } from './pelt';
+
 export interface SbasStackFields {
   /** Interferogram count M. */
   m: number;
@@ -493,19 +663,25 @@ export interface SbasStackFields {
 }
 
 export interface SbasStackSolution {
-  /** Mean LOS velocity (m/yr; NaN where unsolvable). */
+  /** Mean SECULAR LOS velocity (m/yr; NaN where unsolvable). When a
+   *  coseismic step was detected and fitted, this EXCLUDES the step. */
   velocityMPerYr: Float32Array;
   /** Velocity 1σ (m/yr). */
   velocitySigmaMPerYr: Float32Array;
   /** Temporal coherence γ_t ∈ [0,1]. */
   temporalCoherence: Float32Array;
   /** Cumulative displacement per epoch (m) at the SAME resolution —
-   *  [epoch][pixel], epoch 0 is all zeros by construction. */
+   *  [epoch][pixel], epoch 0 is all zeros by construction. INCLUDES any
+   *  fitted step. */
   cumulative: Float32Array[];
   /** Residual RMS (m) per pixel. */
   residualRmsM: Float32Array;
   /** Number of usable interferograms per pixel. */
   usedIfgs: Uint8Array;
+  /** Fitted transient step (m; 0 where none). Step epoch in stepEpoch
+   *  (-1 where none). */
+  stepM: Float32Array;
+  stepEpoch: Int16Array;
 }
 
 export interface InvertStackOptions {
@@ -519,6 +695,8 @@ export interface InvertStackOptions {
   blockEdge?: number;
   /** Progress callback (0..1), optional. */
   onProgress?: (frac: number) => void;
+  /** Minimum |step| (m) for the refit to be attempted (default 20 mm). */
+  stepThresholdM?: number;
 }
 
 /**
@@ -537,6 +715,8 @@ export function invertSbasStack(
   const tempCoh = new Float32Array(pixels);
   const residualRms = new Float32Array(pixels);
   const used = new Uint8Array(pixels);
+  const stepM = new Float32Array(pixels);
+  const stepEpoch = new Int16Array(pixels).fill(-1);
   const cumulative: Float32Array[] = Array.from({ length: nE }, () => new Float32Array(pixels));
 
   const phaseRad = new Float64Array(m);
@@ -584,6 +764,76 @@ export function invertSbasStack(
     opts.onProgress?.(done / nBlocks);
   }
 
+  // ---- Pass 2: PELT-guided step refit (plan §7) --------------------------
+  // Pixels whose smooth-velocity fit fails the temporal-coherence gate are
+  // candidates for a transient (coseismic step). For each, PELT isolates
+  // the change point on the pass-1 cumulative series, and the pixel is
+  // refit with a step-augmented model. On success the pixel is un-masked
+  // with SECULAR velocity + a separate step field.
+  const stepThresholdM = opts.stepThresholdM ?? 0.02;
+  for (let p = 0; p < pixels; p++) {
+    if (used[p] < 4 || !Number.isFinite(residualRms[p])) continue;
+    // Refill the observation scratch arrays for THIS pixel (pass 1 left the
+    // last pixel's data in them).
+    for (let k = 0; k < m; k++) {
+      phaseRad[k] = fields.phase[k][p];
+      coh[k] = fields.coherence[k][p];
+    }
+    // Series from pass 1 (NaN-safe).
+    const series: number[] = [];
+    let ok = true;
+    for (let e = 0; e < nE; e++) {
+      const v = cumulative[e][p];
+      if (!Number.isFinite(v)) {
+        ok = false;
+        break;
+      }
+      series.push(v);
+    }
+    if (!ok) continue;
+    let cp;
+    try {
+      cp = peltChangePoints(series);
+    } catch {
+      continue;
+    }
+    if (cp.changePoints.length === 0) continue;
+    // Largest |step| among the change points (epoch index = displacement
+    // jump boundary).
+    let bestCp = -1;
+    let bestStep = 0;
+    for (const k of cp.changePoints) {
+      const s = series[k] - series[k - 1];
+      if (Math.abs(s) > Math.abs(bestStep)) {
+        bestStep = s;
+        bestCp = k;
+      }
+    }
+    if (bestCp < 1 || Math.abs(bestStep) < stepThresholdM) continue;
+    const stepInterval = bestCp - 1; // step between epoch bestCp-1 and bestCp
+    const sol2 = solveSbasPixelStep(phaseRad, coh, design, stepInterval, {
+      lambda: opts.lambda,
+      looks: opts.looks,
+      metresPerRad: opts.metresPerRad,
+      extraSigmaM: opts.extraSigmaM,
+    });
+    if (!sol2.v || !Number.isFinite(sol2.residualRmsM)) continue;
+    // MODEL-SELECTION ACCEPTANCE: the extra step parameter must pay for
+    // itself — accept only when the weighted residual RMS drops by at least
+    // 30% (a BIC-style improvement; a spurious step on a smooth series
+    // barely changes the residual, a real coseismic step removes most of it).
+    if (!(sol2.residualRmsM < 0.7 * residualRms[p])) continue;
+    velocity[p] = sol2.meanVelocityMPerYr;
+    velocitySigma[p] = sol2.sigmaVelocityMPerYr;
+    tempCoh[p] = sol2.temporalCoherence;
+    residualRms[p] = sol2.residualRmsM;
+    stepM[p] = sol2.stepM;
+    stepEpoch[p] = stepInterval;
+    if (sol2.cumulative) {
+      for (let e = 0; e < nE; e++) cumulative[e][p] = sol2.cumulative[e];
+    }
+  }
+
   return {
     velocityMPerYr: velocity,
     velocitySigmaMPerYr: velocitySigma,
@@ -591,5 +841,7 @@ export function invertSbasStack(
     cumulative,
     residualRmsM: residualRms,
     usedIfgs: used,
+    stepM,
+    stepEpoch,
   };
 }

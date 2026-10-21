@@ -5,7 +5,9 @@ import {
   getDatasetAvailability,
   getRecordedRun,
   listDatasets,
+  getStackDatasetInfo,
 } from '@/lib/data/datasets';
+import { STACK_ID } from '@/lib/science/stacks';
 
 /**
  * GET /api/datasets/[id] — full dataset metadata + provenance.
@@ -27,6 +29,54 @@ export async function GET(
       listDatasets().some((d) => d.id === id);
     if (!known) {
       return NextResponse.json({ ok: false, error: `Unknown dataset: ${id}` }, { status: 404 });
+    }
+
+    // ---- SBAS stack dataset: descriptive info without running the pipeline.
+    if (id === STACK_ID) {
+      const info = getStackDatasetInfo();
+      return NextResponse.json({
+        ok: true,
+        dataset: {
+          id: info.id,
+          slug: 'central-valley-sbas-2026',
+          title: info.title,
+          blurb: info.blurb,
+          mode: 'quantitative' as const,
+          isSynthetic: true,
+          provenance: {
+            datasetId: info.id,
+            provider: 'MOTUS synthetic stack generator (system plan §10 case-study analog)',
+            dataClass: 'synthetic' as const,
+            productType: 'Synthetic GUNW-stack fixture (21 epochs / 24 interferograms)',
+            platform: 'NISAR L-SAR geometry analog (L band, ascending Track 42 analog)',
+            productId: 'stack-central-valley-2026',
+            referenceTime: info.epochs[0],
+            secondaryTime: info.epochs[info.epochs.length - 1],
+            temporalBaselineDays: 252,
+            sourceUrl: 'https://github.com/CodexUjayer/dancing-with-sars (src/lib/science/stacks.ts)',
+            accessNotes: 'Generated deterministically in-process; always available offline.',
+            qualityNotes: info.warnings,
+          },
+          geometry: {
+            wavelength: 0.2360571,
+            incidenceAngleDeg: 34,
+            headingDeg: -12.5,
+            passDirection: 'ascending' as const,
+            lookDirection: 'right' as const,
+          },
+          footprintPolygon: info.footprintPolygon,
+          center: info.center,
+          grid: { width: 288, height: 220, epsg: 32611 },
+          numberOfLooks: 119,
+          availability,
+          stack: {
+            epochs: info.epochs,
+            ifgCount: info.ifgCount,
+            event: info.event,
+          },
+        },
+        warnings: info.warnings,
+      });
     }
 
     const ds = getDataset(id);

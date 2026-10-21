@@ -7,6 +7,7 @@ import type {
   AnalysisResult,
   ProvenanceRecord,
   RadarGeometry,
+  SbasResult,
   TransportGrid,
   UsgsEventLite,
 } from '@/lib/science/types';
@@ -88,10 +89,18 @@ export interface EvidenceAnalysisResult {
   runId?: string;
 }
 
-export type AnalysisPayload = (AnalysisResult & { runId?: string }) | EvidenceAnalysisResult | RecordedRunResult;
+export type AnalysisPayload =
+  | (AnalysisResult & { runId?: string })
+  | EvidenceAnalysisResult
+  | RecordedRunResult
+  | (SbasResult & { runId?: string });
 
 export function isEvidenceResult(r: AnalysisPayload): r is EvidenceAnalysisResult {
   return (r as EvidenceAnalysisResult).kind === 'evidence';
+}
+
+export function isSbasResult(r: AnalysisPayload): r is SbasResult & { runId?: string } {
+  return (r as SbasResult).kind === 'sbas';
 }
 
 /** A real analysis recorded from a past run of the actual product (Mojave). */

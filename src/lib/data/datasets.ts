@@ -30,6 +30,7 @@ import {
   syntheticThrustFixture,
   syntheticNullFixture,
 } from '@/lib/science/fixtures';
+import { STACK_ID, stackDescriptor } from '@/lib/science/stacks';
 
 const DERIVED_ROOT_DEFAULT = path.join(process.cwd(), 'data', 'derived');
 const BROWSE_ROOT_DEFAULT = path.join(process.cwd(), 'data', 'nisar-browse');
@@ -797,6 +798,7 @@ export function getDatasetAvailability(id: string): DatasetAvailability {
   const derived = DERIVED_REGISTRY.find((e) => e.id === id);
   if (derived) return probeDerivedDataset(derived);
   if (id === 'evidence-panama-2026') return probePanamaEvidence();
+  if (id === STACK_ID) return available(); // in-process deterministic fixture
   if (id.startsWith('synthetic-')) return available(); // in-process, deterministic
   return {
     state: 'missing',
@@ -867,6 +869,7 @@ export interface DatasetListEntry {
 const REGISTRY_ORDER = [
   'real-nisar-mojave-2026',
   'evidence-panama-2026',
+  'stack-central-valley-2026',
   'real-nisar-la-2008',
   'synthetic-strikeslip',
   'synthetic-thrust',
@@ -919,6 +922,19 @@ export function listDatasets(): DatasetListEntry[] {
           'NISAR interferometric pairs. Requires the cached CMR/USGS evidence records.';
         dataClass = 'real';
         sensor = 'NASA CMR / ASF DAAC / USGS';
+        referenceTime = '';
+        secondaryTime = '';
+        temporalBaselineDays = 12;
+      } else if (id === STACK_ID) {
+        title = 'Central Valley SBAS time series — full system plan pipeline (synthetic stack)';
+        blurb =
+          '21 acquisitions / 24 interferograms on the 12-day repeat cycle (2026 instrument gap ' +
+          'honoured), driving the complete plan pipeline: atmospheric corrections, SBAS WLS ' +
+          'inversion, PELT change-point isolation, Bayesian causal attribution, GNSS and Brier ' +
+          'validation. A synthetic validation fixture parameterized from published Central ' +
+          'Valley rates — not an observation of the Earth.';
+        dataClass = 'synthetic';
+        sensor = 'MOTUS synthetic stack (Track 42 analog, L-band)';
         referenceTime = '';
         secondaryTime = '';
         temporalBaselineDays = 12;
@@ -995,4 +1011,45 @@ export function derivedRegistryInfo(): Array<{
     sourceUrl: e.provenanceTemplate.sourceUrl,
     accessNotes: e.provenanceTemplate.accessNotes,
   }));
+}
+
+/**
+ * Stack dataset metadata (the SBAS time-series fixture): descriptive info
+ * for the detail endpoint without running the pipeline.
+ */
+export function getStackDatasetInfo(): {
+  id: string;
+  title: string;
+  blurb: string;
+  epochs: string[];
+  ifgCount: number;
+  event: import('@/lib/science/types').StackCatalogEvent;
+  footprintPolygon: [number, number][];
+  center: { lat: number; lon: number };
+  warnings: string[];
+} {
+  const stack = stackDescriptor();
+  return {
+    id: STACK_ID,
+    title: 'Central Valley SBAS time series — full system plan pipeline (synthetic stack)',
+    blurb:
+      '21 acquisitions / 24 interferograms (12-day repeat, 2026-07-27…08-10 instrument gap ' +
+      'honoured) over a California Central Valley analog: two aquifer-compaction bowls, a ' +
+      'tectonic shear gradient and one synthetic M6.2 blind-thrust event drive the complete ' +
+      'plan pipeline end-to-end.',
+    epochs: stack.epochs,
+    ifgCount: stack.ifgCount,
+    event: stack.event,
+    footprintPolygon: stack.footprintPolygon,
+    center: stack.center,
+    warnings: [
+      'SYNTHETIC VALIDATION FIXTURE: the stack is generated deterministically in-process from ' +
+        'published-scale Central Valley deformation rates, a Coalinga-1983-analog event, and ' +
+        'physically-modelled atmosphere (stratified + turbulent troposphere, ionospheric vTEC ' +
+        'ramps). It exercises the complete pipeline against known truth; it is not an observation ' +
+      'of the Earth.',
+      'GNSS validation velocities are fixtures sampled from the same synthetic Earth truth ' +
+        '(the live NGL endpoint was unreachable from this deployment).',
+    ],
+  };
 }

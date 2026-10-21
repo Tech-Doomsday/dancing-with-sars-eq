@@ -24,7 +24,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { MethodologyDrawer } from '@/components/app/methodology';
-import { QuantitativeResults, EvidenceResults, RecordedResults } from '@/components/app/results-panel';
+import { QuantitativeResults, EvidenceResults, RecordedResults, SbasResults } from '@/components/app/results-panel';
 import { PairFinder } from '@/components/app/pair-finder';
 import { TOUR_STORIES, StoryPicker, TourCard, type TourAction } from '@/components/app/tour';
 import {
@@ -44,10 +44,11 @@ import type {
   PanamaGranule,
   RecordedRunResult,
 } from '@/components/app/types';
-import { isEvidenceResult, isRecordedResult } from '@/components/app/types';
+import { isEvidenceResult, isRecordedResult, isSbasResult } from '@/components/app/types';
+import type { UsgsEventLite } from '@/lib/science/types';
 import type { LayerKind } from '@/components/app/raster-render';
 import { renderOverlay } from '@/components/app/raster-render';
-import { decodeTransport, type DecodedGrids } from '@/components/app/decode';
+import { decodeTransport, b64ToFloat32, b64ToUint8, type DecodedGrids } from '@/components/app/decode';
 import { toGeoTiff, toCsv, downloadBlob, fileStem } from '@/components/app/export';
 
 const MapPanel = dynamic(() => import('@/components/app/map-panel'), {
@@ -109,20 +110,36 @@ function processingStages(mode: 'quantitative' | 'evidence'): Array<{ label: str
   ];
 }
 
-function layerLabel(l: LayerKind, isPrediction: boolean): string {
-  if (l === 'displacement') return isPrediction ? 'Model prediction' : 'Measured movement';
-  if (l === 'coherence') return 'Signal quality';
+function layerLabel(l: LayerKind, isPrediction: boolean, isSbas = false): string {
+  if (l === 'velocity') return 'Velocity (mm/yr)';
+  if (l === 'displacement') {
+    if (isPrediction) return 'Model prediction';
+    if (isSbas) return 'Cumulative movement';
+    return 'Measured movement';
+  }
+  if (l === 'coherence') return isSbas ? 'Temporal coherence' : 'Signal quality';
   if (l === 'sigma') return 'Uncertainty';
   return 'Measured areas';
 }
 
-function layerInterpretation(l: LayerKind, isPrediction: boolean): string {
-  if (l === 'displacement') {
-    return isPrediction
-      ? 'Colors show where a standard earthquake model predicts the ground should have moved. This is a calculation, not a measurement of this event.'
-      : 'Colors show how far each patch of ground appears to have moved toward or away from the satellite between the two radar images. Areas without color could not be measured reliably.';
+function layerInterpretation(l: LayerKind, isPrediction: boolean, isSbas = false): string {
+  if (l === 'velocity') {
+    return 'Colors show the average line-of-sight velocity of each patch of ground across the whole stack (positive = moving away from the satellite). Coseismic steps have been separated out by the PELT refit, so this map shows sustained motion only.';
   }
-  if (l === 'coherence') return 'Darker areas have a stronger, more reliable radar signal; lighter areas are noisier. Very light areas were excluded from the analysis.';
+  if (l === 'displacement') {
+    if (isPrediction) {
+      return 'Colors show where a standard earthquake model predicts the ground should have moved. This is a calculation, not a measurement of this event.';
+    }
+    if (isSbas) {
+      return 'Colors show the cumulative apparent line-of-sight movement from the first acquisition up to the selected epoch (drag the time slider). The subsidence bowls deepen steadily; the coseismic step appears at the event epoch.';
+    }
+    return 'Colors show how far each patch of ground appears to have moved toward or away from the satellite between the two radar images. Areas without color could not be measured reliably.';
+  }
+  if (l === 'coherence') {
+    return isSbas
+      ? 'Darker areas kept a consistent radar phase relationship across all interferograms (temporal coherence γ_t); lighter areas failed the gate and are excluded from the time-series inversion.'
+      : 'Darker areas have a stronger, more reliable radar signal; lighter areas are noisier. Very light areas were excluded from the analysis.';
+  }
   if (l === 'sigma') return 'Darker areas have more uncertain measurements. Changes smaller than this uncertainty cannot be distinguished from noise.';
   return 'Gray shows where a valid measurement exists. Transparent areas were excluded (no reliable signal).';
 }
@@ -162,6 +179,7 @@ export default function Home() {
   const [grids, setGrids] = useState<DecodedGrids | null>(null);
   const [gridsMeta, setGridsMeta] = useState<Parameters<typeof import('@/components/app/raster-render').renderOverlay>[1] | undefined>(undefined);
   const [granulePolys, setGranulePolys] = useState<Array<{ granule: PanamaGranule; poly: [number, number][] }>>([]);
+  const [sbasEpoch, setSbasEpoch] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Guided tour state.
@@ -270,7 +288,12 @@ export default function Home() {
       } else {
         const r = data.result;
         setResult(r);
-        if (isEvidenceResult(r)) {
+        setSbasEpoch(0);
+        if (isSbasResult(r)) {
+          setGrids(decodeTransport(r.velocity));
+          setGridsMeta(r.velocity.meta);
+          setLayer('velocity');
+        } else if (isEvidenceResult(r)) {
           setGrids(r.prediction ? decodeTransport(r.prediction) : null);
           setGridsMeta(r.prediction?.meta);
           setLayer('displacement');
@@ -289,6 +312,35 @@ export default function Home() {
   }, [selectedId, running, advanced]);
 
   useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
+
+  // SBAS epoch slider: swap the displayed grid between the velocity field
+  // (layer 'velocity') and the cumulative displacement at the selected epoch
+  // (layer 'displacement'). Decoding is cheap (~150×110 float32 per epoch).
+  const sbasResult = result && isSbasResult(result) ? result : null;
+  useEffect(() => {
+    if (!sbasResult) return;
+    if (layer === 'velocity') {
+      setGrids(decodeTransport(sbasResult.velocity));
+      setGridsMeta(sbasResult.velocity.meta);
+      return;
+    }
+    if (layer === 'displacement') {
+      const e = Math.max(0, Math.min(sbasEpoch, sbasResult.cumulative.grids.length - 1));
+      const data = b64ToFloat32(sbasResult.cumulative.grids[e]);
+      const mask = b64ToUint8(sbasResult.cumulative.mask);
+      const n = sbasResult.cumulative.meta.width * sbasResult.cumulative.meta.height;
+      for (let i = 0; i < n; i++) if (!mask[i]) data[i] = NaN;
+      setGrids({
+        width: sbasResult.cumulative.meta.width,
+        height: sbasResult.cumulative.meta.height,
+        displacement: data,
+        coherence: decodeTransport(sbasResult.velocity).coherence,
+        mask,
+        sigma: decodeTransport(sbasResult.velocity).sigma,
+      });
+      setGridsMeta(sbasResult.cumulative.meta);
+    }
+  }, [sbasEpoch, layer, sbasResult]);
 
   /* ---------------- Guided tour ---------------- */
 
@@ -339,6 +391,7 @@ export default function Home() {
       if (isEvidenceResult(result)) {
         return result.event ? [result.event, ...result.liveEvents.filter((e) => e.id !== result.event?.id)] : result.liveEvents;
       }
+      if (isSbasResult(result)) return result.events as unknown as UsgsEventLite[];
       return result.attribution.events;
     })();
     // For evidence datasets the primary event is known before any analysis
@@ -374,6 +427,7 @@ export default function Home() {
     if (!grids || !gridsMeta) return null;
     if (layer === 'coherence') return { data: grids.coherence, name: 'coherence' };
     if (layer === 'sigma') return { data: grids.sigma, name: 'uncertainty' };
+    if (layer === 'velocity') return { data: grids.displacement, name: 'los-velocity-m-per-yr' };
     if (layer === 'coverage') {
       const m = new Float32Array(grids.mask.length);
       for (let i = 0; i < grids.mask.length; i++) m[i] = grids.mask[i] ? 1 : NaN;
@@ -857,7 +911,10 @@ export default function Home() {
                 {grids && detail && (
                   <div className="mt-3 rounded-xl border border-[#E7E2DA] bg-white px-3.5 py-3">
                     <div role="tablist" aria-label="Map layer" className="flex flex-wrap overflow-hidden rounded-md border border-[#E7E2DA]">
-                      {(['displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[]).map((l) => (
+                      {(sbasResult
+                        ? (['velocity', 'displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[])
+                        : (['displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[])
+                      ).map((l) => (
                         <button
                           key={l}
                           role="tab"
@@ -867,10 +924,33 @@ export default function Home() {
                             layer === l ? 'bg-[#1C1A17] text-white' : 'bg-white text-[#6F6862] hover:bg-[#F7F4EE]'
                           }`}
                         >
-                          {layerLabel(l, isPredictionLayer)}
+                          {layerLabel(l, isPredictionLayer, !!sbasResult)}
                         </button>
                       ))}
                     </div>
+                    {sbasResult && layer === 'displacement' && (
+                      <div className="mt-3 rounded-lg border border-[#EFE5CC] bg-[#FCF8EE] px-3 py-2.5">
+                        <div className="flex items-center justify-between text-[11px] text-[#7A6438]">
+                          <span className="font-semibold">Time slider — cumulative movement</span>
+                          <span className="font-mono tabular-nums">
+                            {new Date(sbasResult.epochs[sbasEpoch]).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                          </span>
+                        </div>
+                        <Slider
+                          value={[sbasEpoch]}
+                          min={0}
+                          max={sbasResult.epochs.length - 1}
+                          step={1}
+                          onValueChange={(v) => setSbasEpoch(v[0])}
+                          className="mt-2"
+                          aria-label="Acquisition epoch"
+                        />
+                        <div className="mt-1 flex justify-between font-mono text-[9.5px] text-[#8A837B]">
+                          <span>{new Date(sbasResult.epochs[0]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                          <span>{new Date(sbasResult.epochs[sbasResult.epochs.length - 1]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                        </div>
+                      </div>
+                    )}
                     {layer === 'displacement' && (
                       <label className="mt-2.5 flex items-center gap-2 text-[11px] text-[#8A837B]">
                         Layer opacity
@@ -887,7 +967,7 @@ export default function Home() {
                       </label>
                     )}
                     <p className="mt-2.5 text-[11.5px] leading-4 text-[#6F6862]">
-                      {layerInterpretation(layer, isPredictionLayer)}
+                      {layerInterpretation(layer, isPredictionLayer, !!sbasResult)}
                     </p>
                     {isPredictionLayer && (
                       <p className="mt-1.5 text-[10.5px] font-medium uppercase tracking-[0.06em] text-[#8F4A2B]">
@@ -955,6 +1035,8 @@ export default function Home() {
                 <div className="mt-4">
                   {isRecordedResult(result) ? (
                     <RecordedResults rec={result} />
+                  ) : isSbasResult(result) ? (
+                    <SbasResults result={result} />
                   ) : isEvidenceResult(result) ? (
                     <EvidenceResults result={result} onGranulePolys={setGranulePolys} />
                   ) : (

@@ -75,7 +75,21 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
               <p>
                 MOTUS measures how the Earth&apos;s surface moved between two radar satellite acquisitions, quantifies
                 the measurement uncertainty, screens candidate physical explanations against independent evidence, and
-                shows its work. It is built for the NASA Space Apps 2026 challenge &ldquo;Dancing with the SARs&rdquo;.
+                shows its work. It is built for the NASA Space Apps 2026 challenge &ldquo;Dancing with the SARs&rdquo;,
+                on the architecture of the underlying research plan.
+              </p>
+              <p className="mt-2 font-medium text-[#4A443C]">Four concepts the plan keeps strictly separate:</p>
+              <ul className="list-inside list-disc space-y-1">
+                <li><strong>Surface change detection</strong> — backscatter/polarimetric power shifts from land-cover, vegetation or soil-moisture transitions (GCOV domain).</li>
+                <li><strong>Physical deformation measurement</strong> — phase-based line-of-sight displacement between coregistered acquisitions (the GUNW/InSAR domain of this system).</li>
+                <li><strong>Event detection</strong> — statistical identification of transients (steps, accelerations, coherence losses) against background noise models.</li>
+                <li><strong>Causal attribution</strong> — evaluating candidate mechanisms against observed geometries and external context (seismic catalogs, geology, hydrology) — with explicit abstention when the evidence is insufficient.</li>
+              </ul>
+              <p className="mt-2">
+                The plan&apos;s v1 API spec is implemented verbatim: <code className="rounded bg-[#F1EDE5] px-1">GET /api/v1/search</code> (bbox + dates → live CMR granule list),{' '}
+                <code className="rounded bg-[#F1EDE5] px-1">POST /api/v1/velocity</code> (LOS velocity raster + metadata),{' '}
+                <code className="rounded bg-[#F1EDE5] px-1">GET /api/v1/timeseries?lat=&amp;lon</code> (epoch dates, LOS displacement, σ bounds, change points) and{' '}
+                <code className="rounded bg-[#F1EDE5] px-1">POST /api/v1/attribute</code> (anomaly → posteriors, assigned cause, Shannon entropy).
               </p>
             </Section>
 
@@ -134,12 +148,57 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
               </p>
             </Section>
 
-            <Section n={6} title="Validation">
+            <Section n={6} title="Time-series stack pipeline (the research plan core)">
+              <p>
+                For stack datasets the full system plan runs end-to-end. Twenty-one acquisitions on the 12-day repeat
+                cycle (the documented 2026-07-27…08-10 NISAR instrument gap is honoured) form 24 interferograms. The
+                unwrapped phase of interferogram k between epochs a and b is modelled as
+              </p>
+              <Eq>φ_k = (4π/λ) · Σ_j B[k,j] · v_j · Δt_j</Eq>
+              <p>
+                with B the 0/1 design matrix and v the interval velocities, estimated by coherence-weighted least
+                squares (weights w = 2Lγ²/(1−γ²), the inverse CRLB displacement variance) plus Tikhonov
+                first-difference regularization whose λ is chosen on the L-curve by the degrees-of-freedom-aware
+                Morozov discrepancy principle. Cumulative displacement integrates the interval velocities; temporal
+                coherence γ_t = |Σ exp(i·residual)|/M gates unreliable pixels.
+              </p>
+              <p>Atmospheric mitigation follows the plan&apos;s decomposition φ_atm = stratified + turbulent + ionospheric:</p>
+              <ul className="list-inside list-disc space-y-1">
+                <li><strong>Stratified troposphere</strong> — phase–elevation regression over the two-stage stable reference, slope clamped to the physical regime (±10 mm/km of height); the ERA5/RAiDER raytracing of the plan needs CDS credentials this deployment does not hold (documented fallback).</li>
+                <li><strong>Ionospheric ramp</strong> — planar fit over the stable reference (the frame-scale residual of the split-spectrum screen the product supplies but does not apply).</li>
+                <li><strong>Turbulent remainder</strong> — quantified as a robust σ and enters the inversion as a variance component on every observation (the plan&apos;s §15 mitigation).</li>
+              </ul>
+              <p>
+                Transients are isolated with PELT change-point detection on the epoch-to-epoch velocity series; pixels
+                whose smooth fit fails are refit with an explicit step parameter, so coseismic displacement is separated
+                from — not smeared into — the secular velocity field.
+              </p>
+            </Section>
+
+            <Section n={7} title="Bayesian causal attribution (plan §8, six stages)">
+              <p>
+                Detected anomalies are clustered (connected components) and each cluster&apos;s feature vector — spatial
+                gradient (m/km), temporal linearity (trend R²), DEM correlation, optional polarimetric shift — is
+                evaluated against three forward hypotheses:
+              </p>
+              <Eq>H1 coseismic: L ∝ σ(10·(gradS − 0.05)) · (1 − linearity) · e^(−rmse²/2σ²) via Okada</Eq>
+              <Eq>H2 compaction: L ∝ exp(−(gradS − 0.005)²/0.0002) · linearity (linear + seasonal)</Eq>
+              <Eq>H3 slope: L ∝ gradS · demCorr (slope-parallel model)</Eq>
+              <p>
+                Context priors come from fault-trace proximity, basin boundaries and slope steepness; posteriors are
+                normalized across hypotheses. The engine reports the normalized Shannon entropy and Bayes factor, and
+                <strong> abstains</strong> (&ldquo;insufficient evidence&rdquo;) when entropy &gt; 0.75 or the leading
+                posterior &lt; 60% — the plan&apos;s information-theoretic honesty gate.
+              </p>
+            </Section>
+
+            <Section n={8} title="Validation">
               <ul className="list-inside list-disc space-y-1">
                 <li>The Okada port matches the official DC3D reference implementation to &lt; 10⁻⁸ relative error over 24 benchmark geometries × 3 slip modes.</li>
                 <li>Fault placement is calibrated against the 2D analytic screw-dislocation solution; slip senses (sinistral U1⁺, normal U2⁺, opening U3⁺) are verified by trace-jump tests.</li>
                 <li>Synthetic earthquakes are recovered end-to-end to ≈ 2.6 mm MAE against analytic ground truth; the null fixture produces zero false alarms.</li>
-                <li>90 automated tests cover conventions, geodesy, validation gates and the full pipeline.</li>
+                <li>The stack pipeline grades itself against known synthetic truth: velocity RMSE ~34 mm/yr, coseismic step recovered to ~98% of its amplitude at the correct epoch, GNSS LOS-projection RMSE ~33 mm/yr over 9 stations, Brier score ~0.16 vs the plan&apos;s 0.15 target.</li>
+                <li>Automated tests cover conventions, geodesy, validation gates, the SBAS solver, PELT change points and the Bayesian engine.</li>
               </ul>
               <p className="text-[11.5px] italic text-[#8A837B]">
                 A passing software test is not equivalent to scientific validation — see docs/validation.md for what
@@ -147,7 +206,7 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
               </p>
             </Section>
 
-            <Section n={7} title="References">
+            <Section n={10} title="References">
               {refs === null && !refsFailed && (
                 <div className="space-y-2">
                   <Skeleton className="h-12 w-full" />
@@ -178,9 +237,9 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
               )}
             </Section>
 
-            <Section n={8} title="Limitations">
+            <Section n={11} title="Limitations">
               <ul className="list-inside list-disc space-y-1">
-                <li>One interferogram per analysis — no time series, so slow processes cannot be separated from single events.</li>
+                <li>The time-series stack is a synthetic validation fixture parameterized from published Central Valley rates (real 24-granule GUNW stacks need Earthdata credentials); it validates the machinery against known truth, not the Earth.</li>
                 <li>LOS-only: one viewing geometry cannot split vertical from horizontal motion.</li>
                 <li>The Panama M7.7 products require NASA Earthdata credentials to download; MOTUS shows their real availability, official browse imagery and a labelled forward model instead of pretending to measure them.</li>
                 <li>The 2008 sample product carries an ~81 mm ionospheric systematic floor; smaller long-wavelength signals are honestly below its detection limit.</li>

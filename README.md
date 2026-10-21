@@ -89,6 +89,20 @@ What makes it scientifically defensible rather than merely functional:
 - **Recorded result** — the flagship Mojave analysis of the real operational NISAR granule
   (source since removed from this server) is served as a clearly-labelled recorded result
   with its real CMR footprint and the real M4.06 event on the map.
+- **SBAS time-series engine (the research-plan core)** — a fourth dataset drives the
+  complete pipeline from the underlying research paper: 21 acquisitions / 24
+  interferograms over a Central Valley analog (12-day repeat, the documented 2026 NISAR
+  instrument gap honoured), with stratified-troposphere + ionospheric-ramp corrections,
+  a coherence-weighted Tikhonov-regularized SBAS inversion (λ from a DOF-aware Morozov
+  L-curve), PELT change-point isolation with step-augmented refits (coseismic steps are
+  separated from the secular velocity instead of smeared into it), the six-stage
+  Bayesian causal engine with entropy abstention, and validation via GNSS LOS-projection
+  RMSE, Brier calibration and analytic truth. An epoch time-slider on the map scrubs
+  through the cumulative displacement; the velocity layer shows sustained motion only.
+- **v1 API (plan §12 spec)** — `GET /api/v1/search` (live CMR granule search),
+  `POST /api/v1/velocity`, `GET /api/v1/timeseries?lat=&lon=`, and
+  `POST /api/v1/attribute` (posteriors, assigned cause, Shannon entropy) are
+  implemented and live.
 
 ## Quick start
 

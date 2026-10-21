@@ -57,52 +57,91 @@ export interface StratifiedCorrection {
  *
  * Mutates `disp` (in-place removal); returns the ledger statistics.
  */
+export interface StratOptions {
+  /**
+   * Physical bound on the phase-per-elevation slope (m of LOS per m of
+   * height). Stratified delay gradients rarely exceed ~10 mm/km of height
+   * (1e-5 m/m); a regression that returns more is fitting deformation or
+   * turbulence, not atmosphere, and is clamped.
+   */
+  maxAbsSlope?: number;
+  /**
+   * Minimum DEM range (m) the regression mask must span for the slope to be
+   * identifiable at all; below this the slope is set to 0 (correction
+   * skipped, honestly reported).
+   */
+  minDemRangeM?: number;
+}
+
 export function removeStratifiedTroposphere(
   disp: Float32Array,
   dem: Float32Array,
   mask: Uint8Array,
+  opts: StratOptions = {},
 ): StratifiedCorrection {
+  const maxAbsSlope = opts.maxAbsSlope ?? 1e-5;
+  const minDemRangeM = opts.minDemRangeM ?? 150;
   const sigmaBefore = madSigma(masked(disp, mask));
+
+  // Identifiability gate: the mask must span enough elevation range.
+  let hMin = Infinity;
+  let hMax = -Infinity;
+  for (let i = 0; i < disp.length; i++) {
+    if (!mask[i]) continue;
+    const h = dem[i];
+    if (!Number.isFinite(h)) continue;
+    if (h < hMin) hMin = h;
+    if (h > hMax) hMax = h;
+  }
+  const demSpan = hMax - hMin;
   let g = 0;
   let intercept = 0;
   let nUsed = 0;
   let mad = Infinity;
+  let skipped = demSpan < minDemRangeM;
 
-  for (let pass = 0; pass < 2; pass++) {
-    // Regress d on h over valid pixels (single pass = O(N) accumulators).
-    let n = 0, sh = 0, sd = 0, shh = 0, shd = 0;
-    for (let i = 0; i < disp.length; i++) {
-      if (!mask[i]) continue;
-      const h = dem[i];
-      const d = disp[i];
-      if (!Number.isFinite(h) || !Number.isFinite(d)) continue;
-      if (pass === 1) {
-        // Second pass: trim residuals > 2.5·MAD from the first-pass fit.
-        const r = d - (g * h + intercept);
-        if (Math.abs(r) > 2.5 * mad) continue;
+  if (!skipped) {
+    for (let pass = 0; pass < 2; pass++) {
+      // Regress d on h over valid pixels (single pass = O(N) accumulators).
+      let n = 0, sh = 0, sd = 0, shh = 0, shd = 0;
+      for (let i = 0; i < disp.length; i++) {
+        if (!mask[i]) continue;
+        const h = dem[i];
+        const d = disp[i];
+        if (!Number.isFinite(h) || !Number.isFinite(d)) continue;
+        if (pass === 1) {
+          // Second pass: trim residuals > 2.5·MAD from the first-pass fit.
+          const r = d - (g * h + intercept);
+          if (Math.abs(r) > 2.5 * mad) continue;
+        }
+        n++;
+        sh += h;
+        sd += d;
+        shh += h * h;
+        shd += h * d;
       }
-      n++;
-      sh += h;
-      sd += d;
-      shh += h * h;
-      shd += h * d;
+      nUsed = n;
+      const den = n * shh - sh * sh;
+      if (n >= 10 && Math.abs(den) > 1e-9) {
+        g = (n * shd - sh * sd) / den;
+        intercept = (sd - g * sh) / n;
+      } else {
+        break;
+      }
+      // Physical clamp: a slope beyond the stratified-delay regime is
+      // fitting deformation/turbulence, not atmosphere.
+      if (Math.abs(g) > maxAbsSlope) {
+        g = Math.sign(g) * maxAbsSlope;
+      }
+      // MAD of current residuals for the next trim.
+      const res: number[] = [];
+      for (let i = 0; i < disp.length; i++) {
+        if (!mask[i]) continue;
+        const r = disp[i] - (g * dem[i] + intercept);
+        if (Number.isFinite(r)) res.push(r);
+      }
+      mad = madSigma(res) || 1e-9;
     }
-    nUsed = n;
-    const den = n * shh - sh * sh;
-    if (n >= 10 && Math.abs(den) > 1e-9) {
-      g = (n * shd - sh * sd) / den;
-      intercept = (sd - g * sh) / n;
-    } else {
-      break;
-    }
-    // MAD of current residuals for the next trim.
-    const res: number[] = [];
-    for (let i = 0; i < disp.length; i++) {
-      if (!mask[i]) continue;
-      const r = disp[i] - (g * dem[i] + intercept);
-      if (Number.isFinite(r)) res.push(r);
-    }
-    mad = madSigma(res) || 1e-9;
   }
 
   // Remove g·(h − h̄) — centre on the mean elevation so the constant part is
@@ -135,7 +174,12 @@ export function removeStratifiedTroposphere(
     sigmaAfterM: sigmaAfter,
     n: nUsed,
     method:
-      'Phase–elevation correlation (iteratively trimmed least squares, two passes, 2.5·MAD trim); ' +
+      (skipped
+        ? `Skipped: the regression mask spans only ${demSpan.toFixed(0)} m of elevation (< ${minDemRangeM} m), ` +
+          'so the stratified slope is not identifiable; no correction was applied. '
+        : '') +
+      'Phase–elevation correlation (iteratively trimmed least squares, two passes, 2.5·MAD trim, ' +
+      `slope clamped to ±${maxAbsSlope.toExponential(0)} m/m — the physical regime of stratified delays); ` +
       'ERA5/RAiDER raytracing requires CDS credentials not held by this deployment ' +
       '(plan §6 fallback, documented in the phase-budget ledger).',
   };
@@ -190,11 +234,11 @@ export function removeLongWavelengthRamp(
       break;
     }
   }
-  const use = (i: number) => (useRef ? isReference[i] && mask[i] : mask[i]);
+  const pixelCounts = (i: number): boolean => (useRef ? isReference[i] === 1 && mask[i] === 1 : mask[i] === 1);
 
   let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0, sz = 0;
   for (let i = 0; i < disp.length; i++) {
-    if (!use(i)) continue;
+    if (!pixelCounts(i)) continue;
     const x = ((i % width) * xSpacing) / 1000; // km for conditioning
     const y = ((Math.floor(i / width)) * Math.abs(ySpacing)) / 1000;
     const z = disp[i];
@@ -258,14 +302,12 @@ export function removeLongWavelengthRamp(
 
 /**
  * Fractal (power-law) turbulent-troposphere simulator for the synthetic
- * validation stack: spectrally-shaped 1/f^β noise with β = 8/3 (Kolmogorov
- * 3-D turbulence integrated along the ray), generated in the Fourier domain
- * with a deterministic seed. Used ONLY to synthesize the exercise fixture;
- * the estimator side never assumes this exact field.
- *
- * Implementation: standard radix-2 inverse FFT on a power-of-two padded
- * grid (row–column separation), then crop to (width, height) and normalize
- * to the requested RMS.
+ * validation stack: a von Kármán-correlated random field with an 8/3 power
+ * law (Kolmogorov 3-D turbulence integrated along the ray), synthesized as
+ * a superposition of plane waves with spectrum-sampled wavenumbers,
+ * uniformly random directions and phases (deterministic seed). This
+ * construction is exact-by-definition (no FFT / Gibbs pitfalls) and is used
+ * ONLY to synthesize the exercise fixture.
  */
 export function turbulentField(
   width: number,
@@ -275,7 +317,6 @@ export function turbulentField(
   pixelKm: number,
   seed: number,
 ): Float32Array {
-  // Deterministic RNG (mulberry32).
   let s = seed >>> 0;
   const rand = () => {
     s = (s + 0x6d2b79f5) >>> 0;
@@ -285,111 +326,58 @@ export function turbulentField(
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 
-  const W = 1 << Math.ceil(Math.log2(Math.max(2, width)));
-  const H = 1 << Math.ceil(Math.log2(Math.max(2, height)));
+  const k0 = 1 / Math.max(correlationKm, 1e-6); // 1/km
+  const kMin = 1 / (Math.max(width, height) * pixelKm); // lowest resolvable mode
+  const kMax = 1 / (2 * pixelKm); // Nyquist
+  const WAVES = 240;
+  const P = 11 / 6; // 2-D field power-law exponent (β = 8/3 process)
 
-  // von Kármán spectrum on the padded frequency grid (cycles/km).
-  const spec = new Float64Array(W * H);
-  const k0 = 1 / Math.max(correlationKm, 1e-6);
-  for (let ky = 0; ky < H; ky++) {
-    const fky = (ky <= H / 2 ? ky : ky - H) / (H * pixelKm);
-    for (let kx = 0; kx < W; kx++) {
-      const fkx = (kx <= W / 2 ? kx : kx - W) / (W * pixelKm);
-      const k = Math.hypot(fkx, fky);
-      const denom = 1 + (k / k0) ** 2;
-      spec[ky * W + kx] = 1 / Math.pow(denom, (8 / 3 + 1) / 2);
+  // Closed-form CDF of the power distribution S(k) ∝ k·(1+(k/k0)²)^(−P).
+  const F = (x: number) => (k0 * k0 / 2) * Math.pow(1 + (x / k0) ** 2, 1 - P) / (1 - P);
+  const fNorm = F(kMax) - F(kMin);
+  const sampleK = (u: number): number => {
+    let lo = kMin;
+    let hi = kMax;
+    for (let it = 0; it < 40; it++) {
+      const mid = 0.5 * (lo + hi);
+      if ((F(mid) - F(kMin)) / fNorm < u) lo = mid;
+      else hi = mid;
     }
+    return 0.5 * (lo + hi);
+  };
+
+  const amps: number[] = [];
+  const kxs: number[] = [];
+  const kys: number[] = [];
+  const phases: number[] = [];
+  for (let w = 0; w < WAVES; w++) {
+    const k = sampleK(rand());
+    const theta = rand() * 2 * Math.PI;
+    amps.push(Math.pow(1 + (k / k0) ** 2, -P / 2)); // sqrt spectral density
+    kxs.push(k * Math.cos(theta));
+    kys.push(k * Math.sin(theta));
+    phases.push(rand() * 2 * Math.PI);
   }
 
-  // Complex spectrum with random phases (Hermitian for a real field).
-  const re = new Float64Array(W * H);
-  const im = new Float64Array(W * H);
-  for (let ky = 0; ky < H; ky++) {
-    for (let kx = 0; kx < W; kx++) {
-      const kMirrorX = kx === 0 ? 0 : W - kx;
-      const kMirrorY = ky === 0 ? 0 : H - ky;
-      const a = ky * W + kx;
-      const b = kMirrorY * W + kMirrorX;
-      if (a >= b) continue; // fill only the independent half
-      const phase = rand() * 2 * Math.PI;
-      const amp = (a === 0 || (kx === W / 2 && ky === H / 2)) ? 0 : spec[a];
-      re[a] = amp * Math.cos(phase);
-      im[a] = amp * Math.sin(phase);
-      re[b] = re[a];
-      im[b] = -im[a];
-    }
-  }
-
-  // Inverse FFT (radix-2, in-place per row then per column).
-  ifft2d(re, im, W, H);
-
-  // Crop + normalize to the requested RMS.
   const out = new Float32Array(width * height);
-  let m = 0;
+  const twoPi = 2 * Math.PI;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      out[y * width + x] = re[y * W + x];
-      m += re[y * W + x] * re[y * W + x];
+      let acc = 0;
+      for (let w = 0; w < WAVES; w++) {
+        acc += amps[w] * Math.cos(twoPi * (kxs[w] * x + kys[w] * y) * pixelKm + phases[w]);
+      }
+      out[y * width + x] = acc;
     }
   }
-  const cur = Math.sqrt(m / (width * height)) || 1;
+
+  // Normalize to the requested RMS.
+  let m = 0;
+  for (let i = 0; i < out.length; i++) m += out[i] * out[i];
+  const cur = Math.sqrt(m / out.length) || 1;
   const scale = rmsM / cur;
   for (let i = 0; i < out.length; i++) out[i] *= scale;
   return out;
-}
-
-/** In-place radix-2 Cooley–Tukey FFT of one complex row/buffer (sign = −1). */
-function fft1d(re: Float64Array, im: Float64Array, n: number, stride: number, inverse: boolean): void {
-  // Bit-reversal permutation.
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      const ti = i * stride;
-      const tj = j * stride;
-      [re[ti], re[tj]] = [re[tj], re[ti]];
-      [im[ti], im[tj]] = [im[tj], im[ti]];
-    }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = ((inverse ? 2 : -2) * Math.PI) / len;
-    const wr = Math.cos(ang);
-    const wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cr = 1;
-      let ci = 0;
-      for (let k = 0; k < len / 2; k++) {
-        const a = (i + k) * stride;
-        const b = (i + k + len / 2) * stride;
-        const ur = re[a];
-        const ui = im[a];
-        const vr = re[b] * cr - im[b] * ci;
-        const vi = re[b] * ci + im[b] * cr;
-        re[a] = ur + vr;
-        im[a] = ui + vi;
-        re[b] = ur - vr;
-        im[b] = ui - vi;
-        const ncr = cr * wr - ci * wi;
-        ci = cr * wi + ci * wr;
-        cr = ncr;
-      }
-    }
-  }
-  if (inverse) {
-    for (let i = 0; i < n * stride; i += stride) {
-      re[i] /= n;
-      im[i] /= n;
-    }
-  }
-}
-
-/** Separable 2-D inverse FFT on W×H data laid out row-major (W = row pitch). */
-function ifft2d(re: Float64Array, im: Float64Array, W: number, H: number): void {
-  // Rows.
-  for (let y = 0; y < H; y++) fft1d(re, im, W, 1, true);
-  // Columns (stride = W).
-  for (let x = 0; x < W; x++) fft1d(re, im, H, W, true);
 }
 
 /**

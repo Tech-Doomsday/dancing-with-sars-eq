@@ -11,6 +11,9 @@ import { DEFAULT_PARAMS } from '@/lib/science/types';
 import type { AnalysisResult, TransportGrid, UsgsEventLite } from '@/lib/science/types';
 import { queryUsgsEvents, filterEventsInWindow, loadStaticEvent } from '@/lib/data/usgs';
 import { buildPredictionOnGrid } from '@/lib/science/attribution';
+import { runSbasPipeline } from '@/lib/science/sbas-pipeline';
+import { STACK_ID, centralValleyStack as centralValleyStackRef } from '@/lib/science/stacks';
+import type { SbasResult } from '@/lib/science/types';
 import { latLonToUtm, utmZoneToEpsg, utmZone } from '@/lib/science/utm';
 import { db } from '@/lib/db';
 
@@ -52,6 +55,11 @@ function cacheKey(datasetId: string, params: unknown): string {
 function b64(arr: Float32Array | Uint8Array): string {
   const u8 = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
   return Buffer.from(u8).toString('base64');
+}
+
+/** Cheap stack access for the window bounds (memoized fixture). */
+function centralValleyStack0() {
+  return centralValleyStackRef();
 }
 
 /** Footprint bbox + margin in degrees. */
@@ -102,6 +110,52 @@ export async function POST(req: Request) {
   }
 
   const { datasetId } = body;
+
+  // ---- SBAS stack datasets run the time-series pipeline (no local-file
+  // gate: the fixture is generated deterministically in-process).
+  if (datasetId === STACK_ID) {
+    const params = { ...DEFAULT_PARAMS, ...(body.params ?? {}) };
+    const key = cacheKey(datasetId, params);
+    if (resultCache.has(key)) {
+      const cached = resultCache.get(key) as { runId?: string } & Record<string, unknown>;
+      return NextResponse.json({ ok: true, cached: true, runId: cached.runId, result: cached });
+    }
+    const warnings: string[] = [];
+    let realEvents: UsgsEventLite[] = [];
+    try {
+      const stack0 = centralValleyStack0();
+      const all = await queryUsgsEvents({
+        startTime: stack0.epochs[0].time,
+        endTime: stack0.epochs[stack0.epochs.length - 1].time,
+        boundingBox: [-122, 34, -118, 39],
+        minMagnitude: 4.0,
+        limit: 50,
+      });
+      realEvents = all;
+    } catch {
+      warnings.push(
+        'Live USGS context query failed; the stack analysis proceeded with the synthetic catalog event only.',
+      );
+    }
+    try {
+      const result = runSbasPipeline(datasetId, params, realEvents);
+      result.warnings.push(...warnings);
+      const run = await db.analysisRun.create({
+        data: {
+          datasetId,
+          status: 'ok',
+          paramsJson: JSON.stringify(params),
+          summaryJson: JSON.stringify(result.summary),
+          durationMs: result.processingMs,
+        },
+      });
+      (result as { runId?: string }).runId = run.id;
+      rememberResult(key, result as unknown as AnalysisResult);
+      return NextResponse.json({ ok: true, runId: run.id, result });
+    } catch (err) {
+      return NextResponse.json({ ok: false, error: (err as Error).message }, { status: 500 });
+    }
+  }
 
   const ds = getDataset(datasetId);
   if (!ds) {

@@ -133,3 +133,28 @@ provenance panel).
 - CI (`.github/workflows/ci.yml`) runs lint, strict type check, offline
   tests and the production build on a clean checkout — no credentials, no
   untracked data.
+
+## SBAS time-series pipeline (system plan implementation, 2026-10-22)
+
+Verified by tests/science/plan-core.test.ts (24 tests) and live E2E:
+
+- Design matrix, WLS solve, missing-observation semantics (unobserved intervals pinned
+  by the displacement prior — the mean velocity underestimates by exactly the
+  unobserved time fraction, reported honestly via per-epoch σ).
+- PELT: clean step isolated at the exact epoch; pure linear trends produce zero change
+  points; NaN rejection.
+- Bayesian engine: broad-linear → SUBSID, steep-stepped with Okada agreement → QUAKE,
+  ambiguous features → UNATTRIBUTED via the posterior rule; non-finite demCorr is
+  neutral (regression test for the posterior-collapse bug).
+- Stack fixture: the 2026-07-27…08-10 instrument gap contains no epoch; one interval
+  widens to 24 days; the quake step epoch brackets the catalog event time.
+- End-to-end pipeline (synthetic stack): subsidence recovered at the truth scale,
+  177 mm coseismic step isolated at the correct epoch, both PRIMARY_CAUSE_QUAKE and
+  PRIMARY_CAUSE_SUBSID present, GNSS RMSE 33.2 mm/yr (9 stations, secular-only
+  comparison), Brier 0.163 (target ≤ 0.15; mixed-zone pixels documented), truth
+  velocity RMSE 34.4 mm/yr, synthetic labelling enforced in the narrative.
+
+Honest limits: the stack is a synthetic fixture parameterized from published Central
+Valley rates (real GUNW stacks need Earthdata credentials); GNSS station velocities are
+fixtures sampled from the same synthetic Earth truth (live NGL endpoint unreachable);
+the Brier score sits just above the plan's 0.15 target on mixed-zone pixels.

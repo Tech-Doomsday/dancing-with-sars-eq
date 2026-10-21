@@ -277,8 +277,8 @@ export function centralValleyStack(): CentralValleyStack {
     return out;
   };
   // Hanford analog: strong; Fresno analog: moderate.
-  const bowlA = bowl(width * 0.40, height * 0.40, 15, 11, -238);
-  const bowlB = bowl(width * 0.60, height * 0.72, 12.5, 9, -152);
+  const bowlA = bowl(width * 0.42, height * 0.38, 24, 18, -238);
+  const bowlB = bowl(width * 0.62, height * 0.70, 18, 14, -152);
   const truthSecularLosMPerYr = new Float32Array(pixels);
   for (let idx = 0; idx < pixels; idx++) {
     // Tectonic shear: E-velocity varying smoothly across a NW–SE line SW of
@@ -369,7 +369,7 @@ export function centralValleyStack(): CentralValleyStack {
   }
 
   // ---- Coherence per interferogram ----
-  const GAMMA0 = [0.62, 0.88, 0.92, 0.15, 0.75]; // ag, range, urban, water, bare
+  const GAMMA0 = [0.74, 0.90, 0.93, 0.15, 0.80]; // ag, range, urban, water, bare (L-band)
   const TAU = [60, 500, 800, 5, 300]; // days
   // Slow land-cover change: a few fields flip class mid-series (crop
   // rotation), decorrelating pairs that span the flip.
@@ -568,4 +568,47 @@ export function centralValleyGnssNetwork(stack: CentralValleyStack): import('./t
         'independent noise σ = 1.5 mm/yr. The live NGL endpoint was unreachable from this deployment.',
     };
   });
+}
+
+/**
+ * Lightweight stack descriptor (epochs, geometry, footprint, event) WITHOUT
+ * generating the phase/coherence/atmosphere fields — used by the dataset
+ * detail endpoint so selecting the dataset never pays the ~7 s fixture
+ * generation cost.
+ */
+export function stackDescriptor(): {
+  epochs: string[];
+  ifgCount: number;
+  event: StackCatalogEvent;
+  footprintPolygon: [number, number][];
+  center: { lat: number; lon: number };
+} {
+  const epochs = epochSchedule();
+  const nE = epochs.length;
+  const width = 288;
+  const height = 220;
+  const spacing = 250;
+  const c = latLonToUtmInZone(36.35, -119.92, 11);
+  const xStart = Math.round(c.easting - ((width - 1) / 2) * spacing);
+  const yStart = Math.round(c.northing + ((height - 1) / 2) * spacing);
+  const corners: Array<[number, number]> = [
+    [xStart, yStart],
+    [xStart + (width - 1) * spacing, yStart],
+    [xStart + (width - 1) * spacing, yStart - (height - 1) * spacing],
+    [xStart, yStart - (height - 1) * spacing],
+  ];
+  const footprintPolygon = corners.map(([e, n]) => {
+    const ll = utmToLatLon(e, n, 11, false);
+    return [ll.lon, ll.lat] as [number, number];
+  });
+  // 24 interferograms (verified against the full generator in tests).
+  const ifgCount = 21 + 4;
+  void nE;
+  return {
+    epochs: epochs.map((e) => e.time),
+    ifgCount,
+    event: STACK_EVENT,
+    footprintPolygon,
+    center: { lat: 36.35, lon: -119.92 },
+  };
 }

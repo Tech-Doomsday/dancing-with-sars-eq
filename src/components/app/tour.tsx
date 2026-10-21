@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Play, X, ChevronLeft, ChevronRight, BookOpen, Copy, Check, Clock, Mountain, Globe2, FlaskConical } from 'lucide-react';
+import { Play, X, ChevronLeft, ChevronRight, BookOpen, Copy, Check, Clock, Mountain, Globe2, FlaskConical, Layers } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogDescription } from '@/components/ui/dialog';
 
@@ -171,6 +171,51 @@ export const TOUR_STORIES: TourStory[] = [
         at: 'Wrap-up',
         narration:
           'Three stories, one tool: measure honestly, attribute carefully, admit limits. Everything you saw is one click away — pick any area and analyze it yourself.',
+      },
+    ],
+  },
+  {
+    id: 'sbas',
+    title: 'Central Valley — the full time-series engine',
+    subtitle: 'The complete research-plan pipeline: SBAS inversion, PELT change points, Bayesian attribution, GNSS + Brier validation.',
+    icon: <Layers className="h-5 w-5" aria-hidden />,
+    durationMin: 2,
+    datasetId: 'stack-central-valley-2026',
+    steps: [
+      {
+        target: 'choose-area',
+        action: { type: 'select', datasetId: 'stack-central-valley-2026' },
+        at: 'The stack',
+        narration:
+          'The research plan calls for time-series analysis, not single pairs. This dataset is a synthetic stack of 21 acquisitions / 24 interferograms over a Central Valley analog — two aquifer-compaction bowls, a tectonic shear gradient, and a synthetic M6.2 blind-thrust earthquake, all with physically-modelled atmosphere.',
+      },
+      {
+        target: 'step-run',
+        action: { type: 'run' },
+        at: 'The full pipeline',
+        narration:
+          'Everything the plan specifies runs for real: stratified-troposphere and ionospheric-ramp corrections, the regularized SBAS inversion with an L-curve-chosen λ, PELT change-point isolation, Bayesian causal attribution, and validation against GNSS and Brier scores.',
+      },
+      {
+        target: 'step-result',
+        action: { type: 'none' },
+        at: 'The verdict',
+        narration:
+          'The one-screen answer now separates two stories: sustained motion (the subsidence bowls, up to ~250 mm/yr) AND a 177 mm time-series step that coincides with the catalog event — detected as a transient, not smeared into a misleading average velocity.',
+      },
+      {
+        target: 'map-section',
+        action: { type: 'none' },
+        at: 'Time slider',
+        narration:
+          'Drag the epoch slider on the map: watch the bowls deepen steadily across the year, then the coseismic step appear at the event epoch. The velocity layer shows sustained motion only — steps were refit out into their own field.',
+      },
+      {
+        target: 'step-result',
+        action: { type: 'none' },
+        at: 'Attribution + validation',
+        narration:
+          'The Bayesian engine ranks causes per anomaly with explicit posteriors and an abstention rule, the coseismic step matches the Okada forward model, and the whole thing is graded: GNSS RMSE ~33 mm/yr, Brier 0.16 against the plan\u2019s 0.15 target, on known synthetic truth.',
       },
     ],
   },

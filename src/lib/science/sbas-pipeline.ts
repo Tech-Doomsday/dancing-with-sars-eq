@@ -260,14 +260,53 @@ export function runSbasPipeline(
       'quantifies the turbulent remainder in the ledger.',
   };
 
-  // Stable reference region: valley-margin band away from the bowls (the
-  // P271-analog window + the far-field frame margins).
+  // Stable reference region — TWO-STAGE (standard practice): start from the
+  // geographic far-field band, then RETAIN only pixels whose cheap first-pass
+  // displacement (the sequential-ifg chain sum) is near zero. This keeps the
+  // plane/ramp fits of stage 2 from absorbing real deformation that leaks
+  // into the geographic band (broad bowls reach the frame margins).
   const isRef = new Uint8Array(pixels);
   for (let i = 0; i < height; i++) {
     for (let j = 0; j < width; j++) {
       const idx = i * width + j;
       if (!stackMask[idx]) continue;
-      if (i < 14 || j > width - 14 || (i < 34 && j > width - 34)) isRef[idx] = 1;
+      if (i < 20 || j > width - 20 || (i < 40 && j > width - 40)) isRef[idx] = 1;
+    }
+  }
+  {
+    const cum = new Float32Array(pixels);
+    const seen = new Uint8Array(pixels);
+    for (let k = 0; k < mIfg; k++) {
+      const ifg = stack.ifgs[k];
+      if (ifg.secIndex - ifg.refIndex !== 1) continue;
+      const ph = stack.phase[k];
+      const co = stack.coherence[k];
+      for (let idx = 0; idx < pixels; idx++) {
+        if (!stackMask[idx]) continue;
+        if (!Number.isFinite(ph[idx]) || co[idx] < cohThreshold) continue;
+        cum[idx] += metresPerRad * ph[idx];
+        seen[idx]++;
+      }
+    }
+    let stableCount = 0;
+    for (let idx = 0; idx < pixels; idx++) {
+      if (isRef[idx] && seen[idx] >= Math.ceil(nE * 0.6) && Math.abs(cum[idx]) < 0.03) {
+        stableCount++;
+      } else {
+        isRef[idx] = 0;
+      }
+    }
+    if (stableCount < 400) {
+      warnings.push(
+        'The stable-reference screening found too few pixels; the atmospheric-correction reference ' +
+          'fell back to the geographic far-field band, which may contain broad deformation.',
+      );
+      for (let i = 0; i < height; i++) {
+        for (let j = 0; j < width; j++) {
+          const idx = i * width + j;
+          if (stackMask[idx] && (i < 20 || j > width - 20 || (i < 40 && j > width - 40))) isRef[idx] = 1;
+        }
+      }
     }
   }
 
@@ -287,7 +326,23 @@ export function runSbasPipeline(
           ? 1
           : 0;
     }
-    const strat = removeStratifiedTroposphere(disp, stack.dem, ifgMask);
+    // Stratified-troposphere regression over the STABLE reference pixels
+    // (estimating atmosphere where deformation ≈ 0 — fitting over the whole
+    // frame lets the regression absorb real deformation that correlates
+    // with elevation). Fallback: the full ifg mask when too few stable
+    // pixels are valid in this interferogram.
+    let stratMask = ifgMask;
+    let stratStable = 0;
+    for (let idx = 0; idx < pixels; idx++) {
+      if (isRef[idx] && ifgMask[idx]) stratStable++;
+    }
+    if (stratStable >= 200) {
+      stratMask = new Uint8Array(pixels);
+      for (let idx = 0; idx < pixels; idx++) {
+        if (isRef[idx] && ifgMask[idx]) stratMask[idx] = 1;
+      }
+    }
+    const strat = removeStratifiedTroposphere(disp, stack.dem, stratMask);
     const ramp = removeLongWavelengthRamp(disp, ifgMask, isRef, width, meta.xSpacing, meta.ySpacing);
     stratRmsAcc += strat.removedRmsM ** 2;
     rampRmsAcc += ramp.removedRmsM ** 2;
@@ -317,14 +372,20 @@ export function runSbasPipeline(
   // stack") implemented as variance-component estimation.
   let turbulentSigmaM = 0;
   {
-    const vals: number[] = [];
-    for (let k = 0; k < Math.min(6, stack.ifgs.filter((f) => f.secIndex - f.refIndex === 1).length); k++) {
+    // Robust per-ifg residual scatter, taken as the MEDIAN over the
+    // sequential interferograms (a single ifg can be atypically clean or
+    // disturbed; the median represents the stack's noise regime).
+    const perIfg: number[] = [];
+    for (let k = 0; k < mIfg; k++) {
+      if (stack.ifgs[k].secIndex - stack.ifgs[k].refIndex !== 1) continue;
+      const vals: number[] = [];
       const ph = correctedPhase[k];
       for (let idx = 0; idx < pixels; idx += 11) {
         if (stackMask[idx] && Number.isFinite(ph[idx])) vals.push(metresPerRad * ph[idx]);
       }
+      if (vals.length > 500) perIfg.push(madSigma(vals));
     }
-    turbulentSigmaM = madSigma(vals);
+    turbulentSigmaM = median(perIfg.length ? perIfg : [0]);
     budget.entries.push({
       key: 'turbulent-troposphere',
       label: 'Turbulent tropospheric remainder (uncorrected; enters the inversion as a variance component)',
@@ -410,7 +471,28 @@ export function runSbasPipeline(
     pixelAreaKm2,
     Math.max(60, Math.round(3 / pixelAreaKm2)),
   );
-  const topClusters = clusters.slice(0, 6);
+  const topClusters = clusters.slice(0, 4);
+
+  // STEP-FIELD clusters (the coseismic anomalies): cluster the fitted
+  // transient steps at a 30 mm floor. These get earthquake-focused
+  // features: the gradient of the STEP field, the (low) linearity of the
+  // stepped series, and the Okada forward model of the catalog event
+  // evaluated against the step amplitudes.
+  const stepClusters = (() => {
+    const stepField = new Float32Array(pixels);
+    for (let idx = 0; idx < pixels; idx++) {
+      stepField[idx] = Number.isFinite(solution.stepM[idx]) ? solution.stepM[idx] : 0;
+    }
+    return clusterVelocityField(
+      stepField,
+      validMask,
+      width,
+      height,
+      0.03,
+      pixelAreaKm2,
+      Math.max(40, Math.round(2 / pixelAreaKm2)),
+    ).slice(0, 2);
+  })();
 
   let fastAreaKm2 = 0;
   for (let idx = 0; idx < pixels; idx++) {
@@ -508,42 +590,20 @@ export function runSbasPipeline(
   // coseismic displacement) dominates the percentile, while isolated noisy
   // pixels do not. The step PIXEL is then the largest jump at that epoch
   // among temporally-coherent pixels.
-  let stepEpoch = -1;
-  let stepP90 = 0;
-  for (let e = 1; e < nE; e++) {
-    const a = solution.cumulative[e - 1];
-    const b = solution.cumulative[e];
-    const jumps: number[] = [];
-    for (let idx = 0; idx < pixels; idx += 2) {
-      if (!validMask[idx]) continue;
-      jumps.push(Math.abs(b[idx] - a[idx]));
-    }
-    if (jumps.length < 100) continue;
-    jumps.sort((x, y) => x - y);
-    const p90 = jumps[Math.floor(jumps.length * 0.9)];
-    if (p90 > stepP90) {
-      stepP90 = p90;
-      stepEpoch = e;
-    }
-  }
+  // ---- Coseismic step field (PELT-guided refit, plan §7) -------------------
+  // The inversion separates SECULAR velocity from fitted transient steps.
+  // The step field drives the earthquake storyline: its peak pixel is the
+  // display series, and its spatial clusters are the coseismic anomalies.
   let stepPeak = 0;
   let stepIdx = -1;
-  if (stepEpoch > 0) {
-    const a = solution.cumulative[stepEpoch - 1];
-    const b = solution.cumulative[stepEpoch];
-    // Among the pixels with the largest jumps at the step epoch, pick the
-    // one with the HIGHEST temporal coherence (the most reliable series to
-    // display), not merely the largest raw jump (which noise can win).
-    const candidates: Array<{ idx: number; jump: number; tc: number }> = [];
-    for (let idx = 0; idx < pixels; idx++) {
-      if (!validMask[idx]) continue;
-      const d = Math.abs(b[idx] - a[idx]);
-      if (d > 0.05) candidates.push({ idx, jump: d, tc: solution.temporalCoherence[idx] });
-    }
-    candidates.sort((x, y) => y.tc - x.tc);
-    if (candidates.length > 0) {
-      stepIdx = candidates[0].idx;
-      stepPeak = candidates[0].jump;
+  let stepEpoch = -1;
+  for (let idx = 0; idx < pixels; idx++) {
+    const s = solution.stepM[idx];
+    if (!Number.isFinite(s) || s === 0) continue;
+    if (Math.abs(s) > Math.abs(stepPeak)) {
+      stepPeak = s;
+      stepIdx = idx;
+      stepEpoch = solution.stepEpoch[idx];
     }
   }
   const refI = Math.round(height * 0.16);
@@ -568,91 +628,6 @@ export function runSbasPipeline(
     const t = Math.max(-halfLen, Math.min(halfLen, dx * ux + dy * uy));
     return Math.hypot(dx - t * ux, dy - t * uy) / 1000;
   };
-
-  const keySeries: KeySeries[] = [];
-  // LOS sign convention: + = away from the satellite (range increase), so
-  // aquifer compaction (ground dropping) appears POSITIVE.
-  if (maxIdx >= 0) {
-    keySeries.push(extractSeries(
-      Math.floor(maxIdx / width), maxIdx % width,
-      'subsidence-peak', 'Fastest away-from-satellite motion',
-      'The pixel with the most positive LOS velocity — ground dropping away from the satellite (the aquifer-compaction convention).',
-    ));
-  }
-  // Basin series: the strongest away-motion OUTSIDE the catalog-event zone
-  // (the aquifer-compaction story without the coseismic superposition).
-  {
-    let bowlIdx = -1;
-    let bowlV = 0;
-    for (let idx = 0; idx < pixels; idx++) {
-      if (!coherentMask[idx]) continue;
-      const v = solution.velocityMPerYr[idx];
-      const dEpi = Math.hypot(pixelX(idx) - epiX, pixelY(idx) - epiY);
-      if (dEpi < 25000) continue;
-      if (v > bowlV) { bowlV = v; bowlIdx = idx; }
-    }
-    if (bowlIdx >= 0) {
-      keySeries.push(extractSeries(
-        Math.floor(bowlIdx / width), bowlIdx % width,
-        'basin-bowl', 'Basin subsidence bowl (outside the event zone)',
-        'The fastest away-from-satellite motion more than 25 km from the catalog event — the aquifer-compaction series without coseismic superposition.',
-      ));
-    }
-  }
-  if (minIdx >= 0 && minIdx !== maxIdx) {
-    keySeries.push(extractSeries(
-      Math.floor(minIdx / width), minIdx % width,
-      'toward-peak', 'Fastest toward-satellite motion',
-      'The pixel with the most negative LOS velocity (ground moving toward the satellite — e.g. the near-field of a reverse-faulting event).',
-    ));
-  }
-  if (stepIdx >= 0) {
-    keySeries.push(extractSeries(
-      Math.floor(stepIdx / width), stepIdx % width,
-      'quake-step', 'Coseismic step candidate',
-      'The pixel with the largest single-epoch jump of the cumulative series — the PELT change-point ' +
-      'candidate evaluated against the catalog event.',
-    ));
-  }
-  if (topClusters.length > 0) {
-    const c = topClusters[0];
-    keySeries.push(extractSeries(
-      c.centroid.i, c.centroid.j,
-      'anomaly-centroid', 'Largest anomaly (centroid)',
-      'Time series at the centroid of the largest velocity anomaly cluster.',
-    ));
-  }
-  keySeries.push(extractSeries(
-    refI, refJ,
-    'stable-reference', 'Stable reference (P271 analog)',
-    'The stable valley-margin window used for phase referencing — expected flat within noise.',
-  ));
-
-  // ---- Stage 5: Bayesian causal engine ------------------------------------
-
-  // Velocity gradient magnitude (m/yr per pixel → displacement m/km).
-  const gradMap = new Float32Array(pixels);
-  const spanYears = yearsOf(nE - 1);
-  for (let i = 1; i < height - 1; i++) {
-    for (let j = 1; j < width - 1; j++) {
-      const idx = i * width + j;
-      if (!validMask[idx]) continue;
-      const dvx = (solution.velocityMPerYr[idx + 1] - solution.velocityMPerYr[idx - 1]) / (2 * meta.xSpacing);
-      const dvy = (solution.velocityMPerYr[idx + width] - solution.velocityMPerYr[idx - width]) / (2 * Math.abs(meta.ySpacing));
-      gradMap[idx] = Math.hypot(dvx, dvy) * spanYears * 1000; // m/km of displacement
-    }
-  }
-
-  // DEM slope magnitude (m/m) for the slide prior.
-  const slopeMap = new Float32Array(pixels);
-  for (let i = 1; i < height - 1; i++) {
-    for (let j = 1; j < width - 1; j++) {
-      const idx = i * width + j;
-      const dhx = (stack.dem[idx + 1] - stack.dem[idx - 1]) / (2 * meta.xSpacing);
-      const dhy = (stack.dem[idx + width] - stack.dem[idx - width]) / (2 * Math.abs(meta.ySpacing));
-      slopeMap[idx] = Math.hypot(dhx, dhy);
-    }
-  }
 
   // Predicted Okada LOS field for the catalog event (H1 forward model).
   const fault = {
@@ -679,10 +654,137 @@ export function runSbasPipeline(
     }
   }
 
-  const anomalies: AnomalyAttribution[] = topClusters.map((cl) => {
+  const keySeries: KeySeries[] = [];
+  // LOS sign convention: + = away from the satellite (range increase), so
+  // aquifer compaction (ground dropping) appears POSITIVE.
+  if (maxIdx >= 0) {
+    const inEventZone = faultTraceDistanceKm(pixelX(maxIdx), pixelY(maxIdx)) < 18;
+    keySeries.push(extractSeries(
+      Math.floor(maxIdx / width), maxIdx % width,
+      'subsidence-peak',
+      inEventZone ? 'Fastest away-from-satellite motion (coseismic lobe)' : 'Fastest away-from-satellite motion',
+      inEventZone
+        ? 'The most positive LOS velocity lies within 18 km of the catalog event trace: it combines the coseismic step with any secular motion (a mean velocity over a stepped series).'
+        : 'The pixel with the most positive LOS velocity — ground dropping away from the satellite (the aquifer-compaction convention).',
+    ));
+  }
+  // Basin series: the strongest away-motion OUTSIDE the catalog-event zone
+  // (the aquifer-compaction story without the coseismic superposition).
+  {
+    let bowlIdx = -1;
+    let bowlV = 0;
+    for (let idx = 0; idx < pixels; idx++) {
+      if (!coherentMask[idx]) continue;
+      const v = solution.velocityMPerYr[idx];
+      const dEpi = Math.hypot(pixelX(idx) - epiX, pixelY(idx) - epiY);
+      if (dEpi < 25000) continue;
+      if (v > bowlV) { bowlV = v; bowlIdx = idx; }
+    }
+    if (bowlIdx >= 0) {
+      keySeries.push(extractSeries(
+        Math.floor(bowlIdx / width), bowlIdx % width,
+        'basin-bowl', 'Basin subsidence bowl (outside the event zone)',
+        'The fastest away-from-satellite motion more than 25 km from the catalog event — the aquifer-compaction series without coseismic superposition.',
+      ));
+    }
+  }
+  if (minIdx >= 0 && minIdx !== maxIdx) {
+    const inEventZone = faultTraceDistanceKm(pixelX(minIdx), pixelY(minIdx)) < 18;
+    keySeries.push(extractSeries(
+      Math.floor(minIdx / width), minIdx % width,
+      'toward-peak',
+      inEventZone ? 'Fastest toward-satellite motion (coseismic lobe)' : 'Fastest toward-satellite motion',
+      'The pixel with the most negative LOS velocity (ground moving toward the satellite).',
+    ));
+  }
+  if (stepIdx >= 0) {
+    keySeries.push(extractSeries(
+      Math.floor(stepIdx / width), stepIdx % width,
+      'quake-step', 'Coseismic step candidate (PELT-isolated transient)',
+      'The pixel with the largest PELT-isolated, step-model-fitted transient of the stack. The SBAS ' +
+      'solution here is the pair (secular velocity, step): the series shows the step explicitly instead ' +
+      'of hiding it inside a misleading mean velocity.',
+    ));
+  }
+  if (topClusters.length > 0) {
+    const c = topClusters[0];
+    keySeries.push(extractSeries(
+      c.centroid.i, c.centroid.j,
+      'anomaly-centroid', 'Largest anomaly (centroid)',
+      'Time series at the centroid of the largest velocity anomaly cluster.',
+    ));
+  }
+  keySeries.push(extractSeries(
+    refI, refJ,
+    'stable-reference', 'Stable reference (P271 analog)',
+    'The stable valley-margin window used for phase referencing — expected flat within noise.',
+  ));
+
+  // ---- Stage 5: Bayesian causal engine ------------------------------------
+
+  const spanYears = yearsOf(nE - 1);
+  // Spatial displacement-gradient feature (plan §8 Stage 3: ∇d in m/km).
+  // Computed on the CUMULATIVE displacement of the last epoch, smoothed
+  // with a 5-px boxcar first (the paper's quake/subsidence centres —
+  // 0.05 / 0.005 m/km — describe the deformation field, not its pixel noise).
+  const gradMap = new Float32Array(pixels);
+  {
+    const last = solution.cumulative[nE - 1];
+    const smooth = new Float32Array(pixels);
+    for (let i = 0; i < height; i++) {
+      for (let j = 0; j < width; j++) {
+        let s = 0;
+        let c = 0;
+        for (let di = -2; di <= 2; di++) {
+          for (let dj = -2; dj <= 2; dj++) {
+            const ii = i + di;
+            const jj = j + dj;
+            if (ii < 0 || jj < 0 || ii >= height || jj >= width) continue;
+            const p = ii * width + jj;
+            if (!validMask[p] || !Number.isFinite(last[p])) continue;
+            s += last[p];
+            c++;
+          }
+        }
+        smooth[i * width + j] = c > 0 ? s / c : NaN;
+      }
+    }
+    for (let i = 1; i < height - 1; i++) {
+      for (let j = 1; j < width - 1; j++) {
+        const idx = i * width + j;
+        const l = smooth[idx - 1];
+        const r = smooth[idx + 1];
+        const u = smooth[idx - width];
+        const d = smooth[idx + width];
+        if (![l, r, u, d].every(Number.isFinite)) continue;
+        gradMap[idx] =
+          Math.hypot((r - l) / (2 * meta.xSpacing), (d - u) / (2 * Math.abs(meta.ySpacing))) * 1000;
+      }
+    }
+  }
+
+  // DEM slope magnitude (m/m) for the slide prior.
+  const slopeMap = new Float32Array(pixels);
+  for (let i = 1; i < height - 1; i++) {
+    for (let j = 1; j < width - 1; j++) {
+      const idx = i * width + j;
+      const dhx = (stack.dem[idx + 1] - stack.dem[idx - 1]) / (2 * meta.xSpacing);
+      const dhy = (stack.dem[idx + width] - stack.dem[idx - width]) / (2 * Math.abs(meta.ySpacing));
+      slopeMap[idx] = Math.hypot(dhx, dhy);
+    }
+  }
+
+  const velocityAnomalies: AnomalyAttribution[] = topClusters.map((cl) => {
     // --- Stage 3 features ---
-    let gradPeak = 0;
-    for (const p of cl.pixels) gradPeak = Math.max(gradPeak, gradMap[p] || 0);
+    let gradSum = 0;
+    let gradN = 0;
+    for (const p of cl.pixels) {
+      if (Number.isFinite(gradMap[p])) {
+        gradSum += gradMap[p];
+        gradN++;
+      }
+    }
+    const gradMean = gradN > 0 ? gradSum / gradN : 0;
     const centroidIdx = cl.centroid.i * width + cl.centroid.j;
     const centroidSeries = keySeries.find((s) => s.i === cl.centroid.i && s.j === cl.centroid.j)
       ?? extractSeries(cl.centroid.i, cl.centroid.j, 'tmp', 'tmp', '');
@@ -696,7 +798,7 @@ export function runSbasPipeline(
     const demCorr = pearson(demVals, dispVals);
 
     const features: CausalFeatures = {
-      gradS: gradPeak,
+      gradS: gradMean,
       tempLinearity: centroidSeries.linearR2,
       demCorr,
       polShift: NaN, // GCOV not ingested for this stack (documented)
@@ -832,15 +934,122 @@ export function runSbasPipeline(
     };
   });
 
+  /** Majority step epoch of a step cluster → ISO time (for the label). */
+  const stepEpochOf = (cl: Cluster): string | undefined => {
+    const hist = new Map<number, number>();
+    for (const p of cl.pixels) {
+      const e = solution.stepEpoch[p];
+      if (e >= 0) hist.set(e, (hist.get(e) ?? 0) + 1);
+    }
+    let best = -1;
+    let bestN = 0;
+    for (const [e, n] of hist) if (n > bestN) { bestN = n; best = e; }
+    return best >= 0 ? stack.epochs[best]?.time?.slice(0, 10) : undefined;
+  };
+
+  // ---- Step-field (coseismic) anomalies ------------------------------------
+  // Features for a step cluster: the spatial gradient of the STEP field
+  // (coseismic lobes are steep by construction), the temporal linearity of
+  // the stepped centroid series (LOW — the step breaks the trend), and the
+  // Okada forward model checked against the step amplitudes (Stage 4).
+  const stepAnomalies: AnomalyAttribution[] = stepClusters.map((cl) => {
+    const centroidIdx = cl.centroid.i * width + cl.centroid.j;
+    const centroidSeries = extractSeries(cl.centroid.i, cl.centroid.j, `step-${cl.id}`, 'Step cluster centroid', '');
+    // Mean |step| over the cluster and its spatial gradient.
+    let stepSum = 0;
+    for (const p of cl.pixels) stepSum += Math.abs(solution.stepM[p]);
+    const meanStep = stepSum / cl.pixels.length;
+    let gradSum = 0;
+    let gradN = 0;
+    for (const p of cl.pixels) {
+      const i = Math.floor(p / width);
+      const j = p % width;
+      if (i < 2 || j < 2 || i >= height - 2 || j >= width - 2) continue;
+      const l = solution.stepM[p - 1] ?? 0;
+      const r = solution.stepM[p + 1] ?? 0;
+      const u = solution.stepM[p - width] ?? 0;
+      const d = solution.stepM[p + width] ?? 0;
+      if ([l, r, u, d].some((v) => !Number.isFinite(v))) continue;
+      gradSum +=
+        Math.hypot((r - l) / (2 * meta.xSpacing), (d - u) / (2 * Math.abs(meta.ySpacing))) * 1000;
+      gradN++;
+    }
+    const gradMean = gradN > 0 ? gradSum / gradN : 0;
+
+    const features: CausalFeatures = {
+      gradS: gradMean,
+      tempLinearity: centroidSeries.linearR2,
+      demCorr: NaN,
+      polShift: NaN,
+    };
+    const priors: CausalPriors = {
+      quake: 0.15 + 0.7 * Math.exp(-faultTraceDistanceKm(pixelX(centroidIdx), pixelY(centroidIdx)) / 20),
+      subsid: 0.15,
+      slide: 0.05,
+    };
+    // H1: step amplitudes vs the Okada prediction over the cluster.
+    let h1r2 = 0;
+    let h1n = 0;
+    for (const p of cl.pixels) {
+      const d = solution.stepM[p] - predQuakeLos[p];
+      h1r2 += d * d;
+      h1n++;
+    }
+    // H2: a step model mis-fit as a linear trend leaves a large residual.
+    let t2 = 0;
+    {
+      const s = centroidSeries.displacementM;
+      let m2 = 0;
+      for (let e2 = 0; e2 < nE; e2++) m2 += s[e2];
+      m2 /= nE;
+      let ss = 0;
+      for (let e2 = 0; e2 < nE; e2++) ss += (s[e2] - m2) ** 2;
+      t2 = Math.sqrt(Math.max(ss * (1 - centroidSeries.linearR2), 0));
+    }
+    const residuals: ForwardModelResiduals = {
+      quakeRmseM: h1n > 0 ? Math.sqrt(h1r2 / h1n) : NaN,
+      quakeSigmaM: 0.045,
+      trendRmseM: t2,
+      trendSigmaM: 0.03,
+      slopeRmseM: NaN,
+      slopeSigmaM: NaN,
+    };
+    const bayes = classifySurfaceAnomaly(features, priors, residuals);
+    const stepTime = stepEpochOf(cl);
+    return {
+      id: `step-${cl.id}`,
+      label: `Coseismic step anomaly (peak ${(Math.abs(cl.peakVelocityMPerYr) * 1000).toFixed(0)} mm${stepTime ? ` after ${stepTime}` : ''})`,
+      pixelCount: cl.pixels.length,
+      areaKm2: cl.areaKm2,
+      centroid: cl.centroid,
+      bbox: cl.bbox,
+      peakVelocityMPerYr: cl.peakVelocityMPerYr,
+      features,
+      priors,
+      residuals,
+      bayes,
+    };
+  });
+
+  const anomalies: AnomalyAttribution[] = [...stepAnomalies, ...velocityAnomalies];
+
   // ---- Stage 6: validation ------------------------------------------------
   // GNSS: exclude stations within 15 km of the catalog event (the InSAR
   // velocity includes the coseismic step; the GNSS fixture velocities are
   // secular — steps are removed in standard GNSS processing).
+  // Secular-only comparison: exclude stations inside the predicted
+  // coseismic displacement field (|Okada LOS| > 20 mm), because the InSAR
+  // MEAN velocity there includes the step while GNSS velocities are
+  // step-removed by standard processing.
   const stations: GnssStation[] = centralValleyGnssNetwork(stack).filter((st) => {
     const u = latLonToUtmInZone(st.lat, st.lon, 11);
-    return Math.hypot(u.easting - epiX, u.northing - epiY) > 15000;
+    if (Math.hypot(u.easting - epiX, u.northing - epiY) <= 15000) return false;
+    const j = Math.min(width - 1, Math.max(0, Math.round((u.easting - meta.xStart) / meta.xSpacing)));
+    const i = Math.min(height - 1, Math.max(0, Math.round((meta.yStart - u.northing) / -meta.ySpacing)));
+    return Math.abs(predQuakeLos[i * width + j]) <= 0.02;
   });
   const zone = zoneFromEpsg(meta.epsg);
+  if (!zone) throw new Error('stack grid must be WGS84 UTM (EPSG 326xx/327xx)');
   const gnss = validateAgainstGnss(
     solution.velocityMPerYr,
     meta,
@@ -881,7 +1090,9 @@ export function runSbasPipeline(
       const i = Math.floor(idx / width);
       const j = idx % width;
       if (i < 1 || j < 1 || i >= height - 1 || j >= width - 1) continue;
-      // Features at pixel scale.
+      // Features at pixel scale. Step-fitted pixels use STEP-field features
+      // (the secular velocity no longer carries the transient).
+      const isStepPixel = Number.isFinite(solution.stepM[idx]) && solution.stepM[idx] !== 0;
       const series: number[] = [];
       for (let e = 0; e < nE; e++) series.push(solution.cumulative[e][idx]);
       const r2 = linearTrendR2(series, epochTimesMs.map((t) => (t - epochTimesMs[0]) / (365.25 * 86400000)));
@@ -899,8 +1110,19 @@ export function runSbasPipeline(
           hv.push(stack.dem[p]);
         }
       }
+      let gradPx = gradMap[idx] || 0;
+      if (isStepPixel) {
+        const l = solution.stepM[idx - 1] ?? 0;
+        const r = solution.stepM[idx + 1] ?? 0;
+        const u = solution.stepM[idx - width] ?? 0;
+        const d = solution.stepM[idx + width] ?? 0;
+        if ([l, r, u, d].every(Number.isFinite)) {
+          gradPx =
+            Math.hypot((r - l) / (2 * meta.xSpacing), (d - u) / (2 * Math.abs(meta.ySpacing))) * 1000;
+        }
+      }
       const feats: CausalFeatures = {
-        gradS: gradMap[idx] || 0,
+        gradS: gradPx,
         tempLinearity: r2,
         demCorr: pearson(hv, dv),
         polShift: NaN,
@@ -924,12 +1146,17 @@ export function runSbasPipeline(
       let q2 = 0;
       let t2 = 0;
       {
-        // H1: |pre/post mean difference − predicted coseismic LOS|.
-        const pre = series.slice(0, Math.max(2, e1p - 1));
-        const post = series.slice(Math.min(nE, e1p + 2));
-        const preMean = pre.reduce((a, b) => a + b, 0) / Math.max(1, pre.length);
-        const postMean = post.reduce((a, b) => a + b, 0) / Math.max(1, post.length);
-        q2 = Math.abs(postMean - preMean - predQuakeLos[idx]);
+        if (isStepPixel) {
+          // H1 for a step pixel: the FITTED step vs the Okada prediction.
+          q2 = Math.abs(solution.stepM[idx] - predQuakeLos[idx]);
+        } else {
+          // H1: |pre/post mean difference − predicted coseismic LOS|.
+          const pre = series.slice(0, Math.max(2, e1p - 1));
+          const post = series.slice(Math.min(nE, e1p + 2));
+          const preMean = pre.reduce((a, b) => a + b, 0) / Math.max(1, pre.length);
+          const postMean = post.reduce((a, b) => a + b, 0) / Math.max(1, post.length);
+          q2 = Math.abs(postMean - preMean - predQuakeLos[idx]);
+        }
         // H2: series vs its LS line (RMSE = std·sqrt(1−R²) exactly).
         let m2 = 0;
         for (let e2 = 0; e2 < nE; e2++) m2 += series[e2];

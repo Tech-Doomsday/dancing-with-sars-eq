@@ -20,7 +20,7 @@
 
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, HelpCircle, Ruler, ShieldQuestion, Lightbulb, Microscope, ArchiveRestore } from 'lucide-react';
+import { ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, HelpCircle, Ruler, ShieldQuestion, Lightbulb, Microscope, ArchiveRestore, Activity, Waves } from 'lucide-react';
 import type { AnalysisResult } from '@/lib/science/types';
 import { HypothesisStatusBadge, MicroLabel, Stat, WhatIsThis, EventRow, fmtMm, fmtKm2 } from './ui-bits';
 import { EvidenceViewer } from './evidence-viewer';
@@ -659,3 +659,195 @@ function HypothesisRow({ h }: { h: import('@/lib/science/types').Hypothesis }) {
 }
 
 export { EventRow };
+
+/* ================================================================== */
+/* SBAS time-series results (system plan §12 pipeline)                 */
+/* ================================================================== */
+
+import {
+  SbasSeriesChart,
+  PosteriorBars,
+  GnssValidationCard,
+  CorrectionsLedger,
+} from './charts';
+import type { SbasResult } from '@/lib/science/types';
+
+export function SbasResults({ result }: { result: SbasResult & { runId?: string } }) {
+  const s = result.summary;
+  const stepAnomalies = result.anomalies.filter((a) => a.id.startsWith('step-'));
+  const velAnomalies = result.anomalies.filter((a) => !a.id.startsWith('step-'));
+  const mmYr = (v: number) => (v * 1000).toFixed(0);
+
+  return (
+    <div className="space-y-6">
+      {/* ---------- 1 · The verdict ---------- */}
+      <motion.div
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="rounded-xl border border-[#E3D5B8] bg-gradient-to-br from-[#FBF6EA] to-[#F6EEDC] p-4"
+      >
+        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-[#8F6A2B]">
+          The one-line answer · SBAS time series ({s.epochCount} epochs / {s.ifgCount} interferograms)
+        </p>
+        <p className="mt-1.5 text-[15px] font-medium leading-[1.55rem] text-[#1C1A17]">
+          {result.narrative.verdict}
+        </p>
+      </motion.div>
+      <p className="-mt-3 rounded-lg border border-[#B0714E]/40 bg-[#F7EBE2] px-3 py-2 text-[11.5px] leading-4 text-[#8F4A2B]">
+        Demonstration stack: a synthetic validation fixture parameterized from published Central Valley rates
+        (plan §10 case study analog). It exercises the complete system pipeline against known truth — it is
+        not an observation of the Earth.
+      </p>
+
+      {/* ---------- 2 · What did we find? ---------- */}
+      <section aria-labelledby="sbas-what">
+        <h2 id="sbas-what" className="text-[13.5px] font-semibold text-[#1C1A17]">What did we find?</h2>
+        <p className="mt-2 text-[13px] leading-[1.5rem] text-[#4A443C]">{result.narrative.whatChanged}</p>
+        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-3.5 sm:grid-cols-3">
+          <Stat label="Fastest away-from-satellite rate" value={`${mmYr(s.maxVelocityMPerYr)} mm/yr`} title="Peak positive LOS velocity (ground moving away from the satellite; subsidence convention)." />
+          <Stat label="Area above rate floor" value={`${s.fastAreaKm2.toFixed(0)} km²`} title={`Area exceeding ${mmYr(s.rateThresholdMPerYr)} mm/yr LOS velocity.`} />
+          <Stat label="Median velocity σ" value={`± ${mmYr(s.medianVelocitySigmaMPerYr)} mm/yr`} title="Median per-pixel 1σ of the secular velocity estimate." />
+          <Stat label="Temporal-coherence retention" value={`${(s.temporalCoherenceRetainedFraction * 100).toFixed(0)}%`} title="Fraction of coherent pixels passing the γ_t ≥ 0.5 gate (plan §11 benchmark)." />
+          <Stat label="Valid coverage" value={`${(s.validFraction * 100).toFixed(0)}%`} title="Fraction of the frame retained through the coherence and temporal gates." />
+          <Stat label="Regularization λ" value={s.lambda.toFixed(2)} title="Tikhonov first-difference weight selected by the L-curve / discrepancy principle (plan §7)." />
+        </div>
+        <p className="mt-2 text-[13px] leading-[1.5rem] text-[#4A443C]">{result.narrative.howMuch}</p>
+      </section>
+
+      {/* ---------- 3 · Time series (PELT + epochs) ---------- */}
+      <section aria-labelledby="sbas-series">
+        <SectionTitle icon={<Activity className="h-3.5 w-3.5" aria-hidden />} id="sbas-series">
+          Time series — where the motion lives
+        </SectionTitle>
+        <div className="mt-2 rounded-xl border border-[#EFEAE2] bg-white p-3.5">
+          <SbasSeriesChart series={result.keySeries} />
+        </div>
+        <EpochHints result={result} />
+      </section>
+
+      {/* ---------- 4 · Bayesian causal attribution ---------- */}
+      <section aria-labelledby="sbas-bayes">
+        <SectionTitle icon={<Microscope className="h-3.5 w-3.5" aria-hidden />} id="sbas-bayes">
+          What could explain it? — Bayesian causal engine (plan §8)
+        </SectionTitle>
+        <p className="mt-2 text-[12.5px] leading-[1.45rem] text-[#4A443C]">
+          Every detected anomaly is evaluated against three physical hypotheses — coseismic rupture
+          (Okada forward model), aquifer compaction (linear + seasonal trend), and slope instability — with
+          context-derived priors (fault-trace proximity, basin boundaries, steep slopes). The engine
+          reports posterior probabilities, a normalized Shannon entropy, and a Bayes factor, and it{' '}
+          <strong className="font-semibold text-[#1C1A17]">abstains</strong> (&ldquo;insufficient
+          evidence&rdquo;) when entropy exceeds 0.75 or the leading posterior stays below 60%.
+        </p>
+        <div className="mt-3 space-y-3">
+          {[...stepAnomalies, ...velAnomalies].map((a) => (
+            <PosteriorBars key={a.id} anomaly={a} />
+          ))}
+        </div>
+        {result.events.length > 0 && (
+          <div className="mt-3 rounded-lg border border-[#EFE5CC] bg-[#FCF8EE] p-3">
+            <p className="text-[11.5px] font-semibold text-[#7A6438]">Catalog events in the stack window</p>
+            {result.events.map((ev) => (
+              <p key={ev.id} className="mt-1 text-[11.5px] leading-4 text-[#6F6862]">
+                <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle ${ev.synthetic ? 'bg-[#C05621]' : 'bg-[#6B8E5A]'}`} />
+                {ev.label} · {new Date(ev.time).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} ·{' '}
+                <a href={ev.url} target="_blank" rel="noreferrer" className="underline decoration-dotted underline-offset-2 hover:text-[#1C1A17]">
+                  source
+                </a>
+              </p>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* ---------- 5 · Validation ---------- */}
+      <section aria-labelledby="sbas-valid">
+        <SectionTitle icon={<ShieldQuestion className="h-3.5 w-3.5" aria-hidden />} id="sbas-valid">
+          How well does it work? — validation (plan §11)
+        </SectionTitle>
+        <div className="mt-2 space-y-4">
+          <GnssValidationCard gnss={result.gnss} />
+          <div className="grid gap-3 sm:grid-cols-2">
+            {result.brier && (
+              <div className="rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-3">
+                <p className="text-[11px] uppercase tracking-wide text-[#8A837B]">Brier score (calibration)</p>
+                <p className={`mt-1 text-[20px] font-semibold ${result.brier.score <= 0.15 ? 'text-[#4A6B3A]' : 'text-[#8F6A2B]'}`}>
+                  {result.brier.score.toFixed(3)}
+                </p>
+                <p className="text-[10.5px] text-[#8A837B]">target ≤ 0.15 · n = {result.brier.n}</p>
+                <p className="mt-1.5 text-[11px] leading-4 text-[#6F6862]">{result.brier.note}</p>
+              </div>
+            )}
+            {result.truthValidation && (
+              <div className="rounded-lg border border-[#EFEAE2] bg-[#FDFCF9] p-3">
+                <p className="text-[11px] uppercase tracking-wide text-[#8A837B]">Velocity RMSE vs analytic truth</p>
+                <p className="mt-1 text-[20px] font-semibold text-[#1C1A17]">
+                  {(result.truthValidation.velocityRmseMPerYr * 1000).toFixed(1)}{' '}
+                  <span className="text-[12px] font-normal text-[#8A837B]">mm/yr</span>
+                </p>
+                <p className="mt-1.5 text-[11px] leading-4 text-[#6F6862]">{result.truthValidation.note}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* ---------- 6 · Corrections ledger ---------- */}
+      <section aria-labelledby="sbas-atm">
+        <SectionTitle icon={<Waves className="h-3.5 w-3.5" aria-hidden />} id="sbas-atm">
+          What was corrected? — phase-budget ledger (plan §6)
+        </SectionTitle>
+        <div className="mt-2">
+          <CorrectionsLedger corrections={result.corrections} />
+        </div>
+      </section>
+
+      {/* ---------- 7 · Reliability ---------- */}
+      <section aria-labelledby="sbas-reli">
+        <SectionTitle icon={<Ruler className="h-3.5 w-3.5" aria-hidden />} id="sbas-reli">
+          How certain are we?
+        </SectionTitle>
+        <p className="mt-2 text-[13px] leading-[1.5rem] text-[#4A443C]">{result.narrative.reliability}</p>
+        {result.warnings.length > 0 && (
+          <ul className="mt-2 list-disc space-y-1 pl-4 text-[11.5px] leading-4 text-[#8F6A2B]">
+            {result.warnings.map((w, i) => (
+              <li key={i}>{w}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function EpochHints({ result }: { result: SbasResult }) {
+  const quake = result.keySeries.find((k) => k.id === 'quake-step');
+  const bowl = result.keySeries.find((k) => k.id === 'basin-bowl' || k.id === 'subsidence-peak');
+  return (
+    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+      {quake && quake.changePoints.length > 0 && (
+        <div className="rounded-lg border border-[#E8D8C4] bg-[#FBF4EA] p-2.5">
+          <p className="text-[11.5px] font-semibold text-[#8F4A2B]">Earthquake signature</p>
+          <p className="mt-1 text-[11.5px] leading-4 text-[#6F6862]">
+            The PELT-isolated transient of{' '}
+            <strong className="font-semibold text-[#1C1A17]">
+              {(Math.abs(quake.changePoints[0].stepM) * 1000).toFixed(0)} mm
+            </strong>{' '}
+            on {quake.changePoints[0].time.slice(0, 10)} is refit as an explicit step parameter, so the
+            secular velocity map is not contaminated by the coseismic displacement.
+          </p>
+        </div>
+      )}
+      {bowl && (
+        <div className="rounded-lg border border-[#DDE5D5] bg-[#F5F8F1] p-2.5">
+          <p className="text-[11.5px] font-semibold text-[#4A6B3A]">Subsidence signature</p>
+          <p className="mt-1 text-[11.5px] leading-4 text-[#6F6862]">
+            The bowl series moves steadily at{' '}
+            <strong className="font-semibold text-[#1C1A17]">{(bowl.velocityMPerYr * 1000).toFixed(0)} mm/yr</strong>{' '}
+            (trend R² {bowl.linearR2.toFixed(2)}) with the seasonal pumping modulation visible — the
+            aquifer-compaction fingerprint.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
