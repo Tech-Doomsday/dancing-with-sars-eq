@@ -158,3 +158,46 @@ Honest limits: the stack is a synthetic fixture parameterized from published Cen
 Valley rates (real GUNW stacks need Earthdata credentials); GNSS station velocities are
 fixtures sampled from the same synthetic Earth truth (live NGL endpoint unreachable);
 the Brier score sits just above the plan's 0.15 target on mixed-zone pixels.
+
+## Tsunami capability (2026-10-24)
+
+Unit/benchmark verification: 46 tests (see `docs/tsunami.md` §7 for the full
+table with acceptance criteria). Highlights: lake-at-rest over wet/dry
+topography to machine precision (≤ 3e-14 m/s); dam-break mass conservation
+4.6e-15 relative with zero positivity violations; linear long-wave speed
+within 3% of √(gh); order-2 grid convergence; Ritter front physics within the
+documented fixed-grid front-capture tolerance; sponge absorption < 5%;
+detection false-alarm 0/12 on synthetic controls; all five evidence states
+unit-tested.
+
+Real-data hindcasts (executed 2026-10-24, live USGS + ETOPO1 + archived
+NOAA DART; exact commands in `docs/tsunami.md` §9):
+
+### Tōhoku 2011 (M 9.1) — 2′ hindcast, run ts-mvmi61bh-u6vsx (2026-10-24)
+
+Configuration: USGS finite-fault model (325 subfaults, ΣM₀ = 4.94×10²² N·m),
+Okada + Tanioka–Seno + Kajiura source on live ETOPO1, 2′ grid (470×481 cells
+over a 16°×22.4° domain), 4 simulated hours, order 2. Wall clock 946 s,
+6,041 steps, mass drift 1.5×10⁻⁵ relative (sponge absorption at open
+boundaries included).
+
+| DART station | observed arrival | observed max | model arrival | model max | Δt | amp ratio | verdict |
+|---|---|---|---|---|---|---|---|
+| 21418 (555 km) | +27 min | 187 cm | +26 min | 157 cm | **0 min** | **1.20** | consistent |
+| 21401 (~970 km) | +59 min | 68 cm | +54 min | 76 cm | **+4 min** | **0.89** | consistent |
+| 21413 | +74 min* | 78 cm | — | — | — | — | inside boundary sponge — not comparable |
+| 21419 | +9 min* | 56 cm | — | — | — | — | outside domain — not comparable |
+| 21420 | no record (archive 404) | | | | | | honest missing state |
+
+*Observed arrivals use the model-informed seismic-phase mask (a water wave
+cannot beat the eikonal ray time; triggers before 0.85×T_eikonal are flagged
+as seismic contamination — the raw triggers at +3/+9 min are the M 9.1's
+Rayleigh/E phases on the pressure records). 21419 sits outside the domain so
+only the fixed 8-min mask applied; its +9 min trigger is likewise seismic.*
+
+The observed maxima match the published NOAA values for this event (21418 ≈
+1.8 m; 21401 ≈ 0.68 m). The simulation — a global 2′ bathymetry model with
+the published finite-fault source and no tuning — reproduces both stations'
+water-wave arrivals within 4 minutes and amplitudes within 20%. Evidence
+classification: **consistent** (with the correlated-buoy and coarse-DEM
+caveats rendered inline).

@@ -231,3 +231,38 @@ screen. Its measurements are apparent relative LOS range change with
 unquantified atmospheric/ionospheric residuals (§ science.md). Synthetic
 fixtures are clearly labelled and are not Earth observations. See
 docs/limitations.md for the complete list.
+
+
+## Tsunami capability (2026-10-24)
+
+The same earthquakes MOTUS watches from space can move the ocean. A new
+"Did the ocean move? Tsunami check." section (below the radar workspace on `/`)
+closes the loop with real observations and real physics:
+
+- **Observations:** live/cached NOAA DART bottom-pressure records (historical
+  archive + ~45-day realtime window), de-tided with a robust local-quadratic
+  fit, MAD-scaled noise, 5σ triggers with a documented seismic-phase mask.
+- **Source:** USGS finite-fault inversions (FFM.geojson) or the MT plane +
+  Wells–Coppersmith scaling (labelled approximation) → Okada dislocations +
+  Tanioka–Seno slope correction + Kajiura water-column filter.
+- **Propagation:** 2-D nonlinear shallow-water equations on live ETOPO1
+  bathymetry — well-balanced hydrostatic-reconstruction finite volumes
+  (Audusse 2004), HLL fluxes with George (2008) dry-front speeds, MUSCL +
+  SSP-RK2, positivity-preserving wet/dry, Manning friction, sponge
+  boundaries. Runs on this server as a background job with honest progress.
+- **Independent estimate:** eikonal travel-time field (fast sweeping).
+- **Evidence:** five transparent levels (insufficient → none-detected →
+  possible → consistent → confirmed-official); observed vs simulated
+  arrivals/amplitudes with documented tolerances; correlated-buoy and
+  coarse-DEM caveats rendered inline; "confirmed" is only ever a citation.
+
+Verified: 46 tsunami tests (lake-at-rest to machine precision, mass
+conservation 4.6e-15, wave speed within 3% of √(gh), order-2 convergence,
+0/12 false alarms on controls) plus real-data hindcasts against archived DART
+records — see `docs/tsunami.md` (methods + limitations),
+`docs/tsunami-evidence-matrix.md` (feature → reference → data → status) and
+`docs/validation.md` (executed results).
+
+APIs: `GET /api/tsunami/events`, `GET /api/tsunami/events/[id]`,
+`GET /api/tsunami/observations?event=…`, `POST /api/tsunami/simulate`,
+`GET /api/tsunami/runs/[id]`.

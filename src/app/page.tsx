@@ -26,6 +26,15 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { MethodologyDrawer } from '@/components/app/methodology';
 import { QuantitativeResults, EvidenceResults, RecordedResults, SbasResults } from '@/components/app/results-panel';
 import { PairFinder } from '@/components/app/pair-finder';
+
+/** Tsunami capability (2026-10-24): real DART records + NSWE simulation.
+ * Loaded lazily — the radar workspace stays the primary flow. */
+const TsunamiPanel = dynamic(
+  () => import('@/components/app/tsunami-panel').then((m) => m.default),
+  { ssr: false, loading: () => (
+    <div className="mt-12 h-24 animate-pulse rounded-xl border border-[#EFEAE2] bg-white" aria-label="Loading tsunami tools" />
+  ) },
+);
 import { TOUR_STORIES, StoryPicker, TourCard, type TourAction } from '@/components/app/tour';
 import {
   DataClassBadge,
@@ -1190,6 +1199,9 @@ export default function Home() {
         </div>
 
         {/* ---------- Honest scope note ---------- */}
+        {/* ---------- Tsunami capability: ocean check + physics simulation ---------- */}
+        <TsunamiPanel />
+
         <section id="scope-note" aria-label="About the results" className="mt-10 scroll-mt-20 rounded-xl border border-[#E7E2DA] bg-white p-5">
           <h2 className="text-[14px] font-semibold text-[#1C1A17]">What MOTUS can and cannot tell you</h2>
           <ul className="mt-2.5 grid gap-2 text-[12.5px] leading-[1.45rem] text-[#6F6862] sm:grid-cols-2">

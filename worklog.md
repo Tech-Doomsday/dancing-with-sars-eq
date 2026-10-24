@@ -363,3 +363,17 @@ Work Log:
 Stage Summary:
 - The rollback wiped all uncommitted work; every code feature is rebuilt and browser-verified on the surviving real data (LA-2008 live measured swipe, Panama evidence prediction swipe, Mojave recorded result).
 - The ONE thing that cannot be restored without the user: their Earthdata token (the only surviving copy is the known-corrupted one). The rebuilt /api/earthdata/token route + paste box are ready — once the user re-pastes a valid token, the Mojave granule (2.58 GB) and the measured Panama granule (1.48 GB) can be re-downloaded and re-registered to bring back the full 4-dataset live experience.
+
+---
+Task ID: 18 (tsunami system — Phase A/B)
+Agent: main (Z.ai Code)
+Task: Implement the tsunami research/simulation system from "Tsunami Simulation Research Plan.pdf" inside MOTUS, preserving the existing radar functionality.
+
+Work Log:
+- Read the full 26-page plan; audited its equations against primary sources (docs/tsunami-evidence-matrix.md): corrections recorded for the appendix 1-D CFL (2-D sum used), Okada via official DC3D lineage (existing okada.ts) instead of the PDF's garbled transcription, fixed 0.05 m arrival threshold vs noise-adaptive detection separated, Mw/depth screening labelled heuristic, HLL chosen over HLLC (contact wave immaterial for tsunami; robust wet/dry), FES2014/UTide de-tiding replaced by documented local-quadratic detide (Copernicus auth unavailable).
+- Audited the repo: existing verified Okada DC3D port, USGS FDSN client, attribution engine, Leaflet map stack, b64 grid transport, Prisma run store, 127 passing tests — the tsunami modules integrate with these rather than replacing anything.
+- LIVE DATA PROBES (all verified 2026-10-24): USGS FDSN + finite-fault FFM.geojson (Maule: 236 subfaults w/ slip/rake/polygon geometry); ETOPO1 Bedrock via NCEI THREDDS OPeNDAP ascii (8°×6° @1′ in 4 s); NOAA DART historical archive (format parsed, 9999=missing, Tōhoku 21418 signal recovered: σ=2.7 cm, peak 1.86 m matching the published ≈1.8 m); NDBC realtime2 DART (45 stations, ~45-day lookback → covers the 2026-10-09 Panama M7.7 window); IOC retains only ~17 h (BLOCKED for events, documented); NCEI hazel run-up API 404 (BLOCKED, documented); CO-OPS works (US-only, not integrated v1).
+- Curated real events: Tōhoku 2011 M9.1 (usgs official20110311054624120_30, FFM available, DART 21418/21413/21419/21401 archive), Maule 2010 M8.8 (official20100227063411530_30, FFM available), Panama 2026 M7.7 strike-slip (us6000u18k — the app's own evidence event; realtime DART 32413/43413 check).
+
+Stage Summary:
+- Architecture decided: TypeScript zero-new-dependency implementation. Science modules in src/lib/tsunami/ (etopo, dart, source w/ Okada+Tanioka-Seno+Kajiura, 2-D NSWE FV solver w/ hydrostatic reconstruction + wet/dry + Manning + sponge, fast-sweeping travel time, detection, 5-level evidence classification, runner with chunked-async jobs) + /api/tsunami/* routes + a tsunami section in the single-page UI. BLOCKED capabilities (EnKF, FNO surrogates, GPU, Boussinesq, tide-gauge validation, run-up DB, uncertainty ensembles) are documented, never imitated.

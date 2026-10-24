@@ -483,6 +483,49 @@ export function geoFaultDisplacementENU(
 }
 
 /**
+ * Top-edge variant for tsunami source construction (2026-10-24, additive):
+ * surface displacement (ENU, metres) at a point given in local east/north
+ * offsets (metres) from the surface projection of the fault's TOP-EDGE
+ * midpoint, with the top edge at exactly `topEdgeDepthM`.
+ *
+ * Used by the tsunami finite-fault reader (USGS FFM.geojson subfaults carry
+ * top-edge corner depths), where the centroid bookkeeping of
+ * geoFaultDisplacementENU would be circular. Same conventions otherwise.
+ */
+export function geoFaultDisplacementENUTopEdge(
+  fault: GeoFault,
+  topEdgeDepthM: number,
+  eastM: number,
+  northM: number,
+): { east: number; north: number; up: number; singular: boolean } {
+  const { u1, u2, u3 } = rakeToDislocations(fault.slipM, fault.rakeDeg);
+  const strike = (fault.strikeDeg * Math.PI) / 180;
+
+  const sx = Math.sin(strike);
+  const sy = Math.cos(strike);
+  const dx = Math.cos(strike);
+  const dy = -Math.sin(strike);
+
+  const fx = eastM * sx + northM * sy;
+  const fy = eastM * dx + northM * dy;
+
+  const res = okadaSurfaceDisplacement(fx, fy, {
+    depth: Math.max(0, topEdgeDepthM),
+    dipDeg: fault.dipDeg,
+    length: fault.lengthM,
+    width: fault.widthM,
+    u1, u2, u3,
+  });
+
+  return {
+    east: res.ux * sx + res.uy * dx,
+    north: res.ux * sy + res.uy * dy,
+    up: res.uz,
+    singular: res.singular,
+  };
+}
+
+/**
  * Seismic moment from moment magnitude (Hanks & Kanamori 1979):
  * M0 = 10^(1.5*Mw + 9.1) N*m.
  */

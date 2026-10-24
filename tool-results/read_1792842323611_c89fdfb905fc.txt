@@ -1,0 +1,757 @@
+     1→'use client';
+     2→
+     3→/**
+     4→ * The map panel — Leaflet with the Mercator-exact raster overlay,
+     5→ * footprints, earthquake events, hover readout and legend.
+     6→ *
+     7→ * Before/After swipe mode (2026-10-24): a single map instance keeps zoom,
+     8→ * pan and geographic bounds synchronized across both sides BY CONSTRUCTION.
+     9→ * The BEFORE side shows the Esri World Imagery satellite basemap alone; the
+    10→ * AFTER side shows the same imagery with the measured change layer clipped
+    11→ * to the right of a draggable divider. The base imagery is a multi-date
+    12→ * satellite composite — the acquisition dates label the radar measurement,
+    13→ * not the base image (disclosed under the map).
+    14→ *
+    15→ * Pixel-exact divider (2026-10-24): the clip is computed in PIXELS in
+    16→ * Leaflet's layer coordinate space — containerPointToLayerPoint(swipeX% of
+    17→ * container width) minus the image element's own offset — and re-applied on
+    18→ * every drag, overlay re-render, mode toggle and map move/zoom/resize, so
+    19→ * the reveal edge stays glued to the handle at any zoom/pan (a percentage
+    20→ * clip-path would resolve against the image's own moving box and drift).
+    21→ *
+    22→ * Basemap: the same realistic satellite imagery is used in EVERY mode —
+    23→ * idle (before analyzing), swipe and single-layer — so the map the visitor
+    24→ * first sees already has the realism and terrain depth of the post-analysis
+    25→ * view. A sparse Esri reference layer (place names, boundaries) sits on top
+    26→ * so the photo stays orientable without giving up realism.
+    27→ */
+    28→
+    29→import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+    30→import { MapContainer, TileLayer, Polygon, CircleMarker, ImageOverlay, Tooltip, ScaleControl, useMap, useMapEvents } from 'react-leaflet';
+    31→import L from 'leaflet';
+    32→import 'leaflet/dist/leaflet.css';
+    33→import { ChevronsLeftRight, HelpCircle } from 'lucide-react';
+    34→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+    35→import type { DatasetDetail, PanamaGranule } from './types';
+    36→import type { UsgsEventLite } from '@/lib/science/types';
+    37→import type { DecodedGrids } from './decode';
+    38→import type { LayerKind, RenderedOverlay } from './raster-render';
+    39→import { renderOverlay, sampleAt, gridBounds } from './raster-render';
+    40→import { displacementColor, phaseColor } from './colormap';
+    41→
+    42→export interface BeforeAfterInfo {
+    43→  /** Radar acquisition dates that bracket the measured change. */
+    44→  refTime: string;
+    45→  secTime: string;
+    46→  /** True when the overlay is a forward-model prediction, not a measurement. */
+    47→  prediction: boolean;
+    48→}
+    49→
+    50→export interface MapPanelProps {
+    51→  dataset: DatasetDetail;
+    52→  /** Decoded transport grids (quantitative result) */
+    53→  grids?: DecodedGrids | null;
+    54→  gridsMeta?: RenderedOverlay extends never ? never : {
+    55→    xStart: number; xSpacing: number; yStart: number; ySpacing: number;
+    56→    width: number; height: number; epsg: number;
+    57→  };
+    58→  layer: LayerKind;
+    59→  opacity: number;
+    60→  events: UsgsEventLite[];
+    61→  primaryEvent?: UsgsEventLite | null;
+    62→  /** Granule footprints (evidence mode) */
+    63→  granulePolys?: Array<{ granule: PanamaGranule; poly: [number, number][] }>;
+    64→  /** Before/After acquisition info — enables the swipe divider. */
+    65→  beforeAfter?: BeforeAfterInfo | null;
+    66→  /** Radar wavelength (metres) — used by the advanced phase layer. */
+    67→  wavelengthM?: number;
+    68→  /** Swipe mode toggle (page-level mapMode state). */
+    69→  swipe?: boolean;
+    70→}
+    71→
+    72→function fmtDay(iso: string): string {
+    73→  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    74→}
+    75→function fmtDayShort(iso: string): string {
+    76→  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    77→}
+    78→
+    79→function ZoomControls({ belowChip }: { belowChip?: boolean }) {
+    80→  const map = useMap();
+    81→  return (
+    82→    <div className={`absolute right-3 z-[500] flex flex-col overflow-hidden rounded-md border border-[#E7E2DA] bg-white ${belowChip ? 'top-11' : 'top-3'}`}>
+    83→      <button
+    84→        type="button"
+    85→        aria-label="Zoom in"
+    86→        onClick={() => map.zoomIn()}
+    87→        className="flex h-7 w-7 items-center justify-center text-[16px] leading-none text-[#4A443C] transition-colors hover:bg-[#F7F4EE]"
+    88→      >
+    89→        +
+    90→      </button>
+    91→      <div className="h-px bg-[#E7E2DA]" />
+    92→      <button
+    93→        type="button"
+    94→        aria-label="Zoom out"
+    95→        onClick={() => map.zoomOut()}
+    96→        className="flex h-7 w-7 items-center justify-center text-[16px] leading-none text-[#4A443C] transition-colors hover:bg-[#F7F4EE]"
+    97→      >
+    98→        −
+    99→      </button>
+   100→    </div>
+   101→  );
+   102→}
+   103→
+   104→function FitBounds({ polygon }: { polygon: [number, number][] }) {
+   105→  // `polygon` arrives as [lat, lon] pairs (already normalised by the caller).
+   106→  const map = useMap();
+   107→  useEffect(() => {
+   108→    if (polygon.length > 2) {
+   109→      const bounds = L.latLngBounds(polygon as L.LatLngExpression[]);
+   110→      map.fitBounds(bounds.pad(0.25));
+   111→    }
+   112→  }, [map, polygon]);
+   113→  return null;
+   114→}
+   115→
+   116→/**
+   117→ * Re-applies the swipe clip on every map interaction. Takes a REF to the
+   118→ * (swipeX-dependent) clip function so the Leaflet event subscriptions stay
+   119→ * stable across drags.
+   120→ */
+   121→function ClipSync({ clipRef }: { clipRef: React.MutableRefObject<() => void> }) {
+   122→  useMapEvents({
+   123→    move: () => clipRef.current(),
+   124→    zoomend: () => clipRef.current(),
+   125→    resize: () => clipRef.current(),
+   126→    overlayadd: () => clipRef.current(),
+   127→  });
+   128→  return null;
+   129→}
+   130→
+   131→function HoverReadout({
+   132→  grids,
+   133→  gridsMeta,
+   134→  layer,
+   135→  wavelengthM,
+   136→}: {
+   137→  grids: DecodedGrids | null;
+   138→  gridsMeta?: MapPanelProps['gridsMeta'];
+   139→  layer: LayerKind;
+   140→  wavelengthM?: number;
+   141→}) {
+   142→  const [pos, setPos] = useState<{ lat: number; lon: number } | null>(null);
+   143→  const [sample, setSample] = useState<{ displacement: number; coherence: number; sigma: number; detected: boolean } | undefined>();
+   144→  const lastRef = useRef(0);
+   145→  useMapEvents({
+   146→    mousemove(e) {
+   147→      const now = performance.now();
+   148→      if (now - lastRef.current < 33) return;
+   149→      lastRef.current = now;
+   150→      setPos({ lat: e.latlng.lat, lon: e.latlng.lng });
+   151→      if (grids && gridsMeta) {
+   152→        setSample(sampleAt(grids, gridsMeta, e.latlng.lat, e.latlng.lng));
+   153→      } else {
+   154→        setSample(undefined);
+   155→      }
+   156→    },
+   157→    mouseout() {
+   158→      setPos(null);
+   159→      setSample(undefined);
+   160→    },
+   161→  });
+   162→  if (!pos) return null;
+   163→  const fmt = (v: number | undefined, unit: string, scale = 1000, digits = 1) =>
+   164→    v === undefined || Number.isNaN(v) ? '—' : `${(v * scale).toFixed(digits)} ${unit}`;
+   165→  let value = '—';
+   166→  let label = '';
+   167→  if (sample) {
+   168→    if (layer === 'velocity') {
+   169→      const mmYr = sample.displacement * 1000;
+   170→      value = `${mmYr >= 0 ? '+' : ''}${mmYr.toFixed(1)} mm/yr`;
+   171→      label = mmYr >= 0 ? 'moving away from satellite' : 'moving toward satellite';
+   172→    } else if (layer === 'detected') {
+   173→      if (sample.detected) {
+   174→        const mm = sample.displacement * 1000;
+   175→        value = `${mm >= 0 ? '+' : '−'}${Math.abs(mm).toFixed(1)} mm`;
+   176→        label = mm >= 0 ? 'ground moved away (sank)' : 'ground moved toward (rose)';
+   177→      } else {
+   178→        value = 'no change';
+   179→        label = 'below the detection threshold';
+   180→      }
+   181→    } else if (layer === 'phase') {
+   182→      const mm = sample.displacement * 1000;
+   183→      const half = wavelengthM ? (wavelengthM / 2 * 100).toFixed(1) : '12';
+   184→      value = `${Math.abs(mm).toFixed(1)} mm`;
+   185→      label = `one full color cycle ≈ ${half} cm`;
+   186→    } else if (layer === 'displacement' || layer === 'coverage') {
+   187→      const mm = sample.displacement * 1000;
+   188→      value = `${Math.abs(mm).toFixed(1)} mm`;
+   189→      label = mm >= 0 ? 'away from satellite' : 'toward satellite';
+   190→    } else if (layer === 'coherence') {
+   191→      value = Number.isFinite(sample.coherence) ? sample.coherence.toFixed(2) : '—';
+   192→      label = 'signal quality (0–1)';
+   193→    } else {
+   194→      value = fmt(sample.sigma, 'mm');
+   195→      label = 'uncertainty';
+   196→    }
+   197→  }
+   198→  return (
+   199→    <div
+   200→      className="absolute left-3 top-3 z-[500] rounded-lg border bg-white/95 px-3 py-2 font-mono text-[11px] leading-4 text-[#4A443C] shadow-sm"
+   201→      aria-live="polite"
+   202→    >
+   203→      <div>{pos.lat.toFixed(4)}°, {pos.lon.toFixed(4)}°</div>
+   204→      <div className="text-[#1C1A17]">
+   205→        {value}
+   206→        {label && <span className="ml-1.5 font-sans text-[10px] text-[#8A837B]">{label}</span>}
+   207→      </div>
+   208→    </div>
+   209→  );
+   210→}
+   211→
+   212→function Legend({ layer, scaleMaxM, wavelengthM }: { layer: LayerKind; scaleMaxM?: number; wavelengthM?: number }) {
+   213→  if (layer === 'coverage') {
+   214→    return (
+   215→      <div className="absolute bottom-3 left-3 z-[500] rounded-lg border bg-white/95 px-3 py-2 shadow-sm">
+   216→        <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[#8A837B]">Where measurements exist</div>
+   217→        <div className="flex items-center gap-2">
+   218→          <span className="h-2 w-8 rounded-sm border border-[#E7E2DA]" style={{ background: 'rgb(148,140,129)' }} />
+   219→          <span className="font-mono text-[10px] text-[#6F6862]">measured</span>
+   220→        </div>
+   221→        <div className="mt-1 text-[10px] text-[#8A837B]">transparent = signal too weak to measure</div>
+   222→      </div>
+   223→    );
+   224→  }
+   225→  if (layer === 'detected') {
+   226→    return (
+   227→      <div className="absolute bottom-3 left-3 z-[500] rounded-lg border bg-white/95 px-3 py-2 shadow-sm">
+   228→        <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[#8A837B]">Detected change — high confidence</div>
+   229→        <div className="flex items-center gap-3">
+   230→          <span className="flex items-center gap-1.5">
+   231→            <span className="h-2.5 w-4 rounded-sm border border-[#E7E2DA]" style={{ background: displacementColor(-0.8) }} />
+   232→            <span className="font-mono text-[10px] text-[#6F6862]">ground rose</span>
+   233→          </span>
+   234→          <span className="flex items-center gap-1.5">
+   235→            <span className="h-2.5 w-4 rounded-sm border border-[#E7E2DA]" style={{ background: displacementColor(0.8) }} />
+   236→            <span className="font-mono text-[10px] text-[#6F6862]">ground sank</span>
+   237→          </span>
+   238→        </div>
+   239→        <div className="mt-1 text-[10px] text-[#8A837B]">
+   240→          only areas where the measured change is bigger than the uncertainty are colored
+   241→        </div>
+   242→      </div>
+   243→    );
+   244→  }
+   245→  if (layer === 'phase') {
+   246→    const half = wavelengthM ? (wavelengthM / 2 * 100).toFixed(1) : '12';
+   247→    const gradient = `linear-gradient(to right, ${[0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]
+   248→      .map((f) => phaseColor(f))
+   249→      .join(', ')})`;
+   250→    return (
+   251→      <div className="absolute bottom-3 left-3 z-[500] rounded-lg border bg-white/95 px-3 py-2 shadow-sm">
+   252→        <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[#8A837B]">Radar phase — advanced view</div>
+   253→        <div className="flex items-center gap-2">
+   254→          <div className="h-2 w-32 rounded-sm border border-[#E7E2DA]" style={{ background: gradient }} />
+   255→        </div>
+   256→        <div className="mt-1 text-[10px] text-[#8A837B]">
+   257→          like contour lines: each full color cycle ≈ {half} cm of ground movement · the plain movement map is computed from this
+   258→        </div>
+   259→      </div>
+   260→    );
+   261→  }
+   262→  const isVel = layer === 'velocity';
+   263→  const gradient =
+   264→    layer === 'displacement' || isVel
+   265→      ? `linear-gradient(to right, ${displacementColor(-1)}, ${displacementColor(-0.34)}, ${displacementColor(0)}, ${displacementColor(0.34)}, ${displacementColor(1)})`
+   266→      : layer === 'coherence'
+   267→        ? `linear-gradient(to right, #F5F1E8, #CBC3B5, #8A837A, #4A443C)`
+   268→        : `linear-gradient(to right, #F5F1E8, #E2C7AC, #B0714E, #7A4A2B)`;
+   269→  const left =
+   270→    layer === 'displacement' || isVel
+   271→      ? isVel
+   272→        ? `${((scaleMaxM ?? 0.05) * 1000).toFixed(0)} mm/yr toward`
+   273→        : `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm toward`
+   274→      : layer === 'coherence'
+   275→        ? 'weak signal'
+   276→        : 'low';
+   277→  const right =
+   278→    layer === 'displacement' || isVel
+   279→      ? isVel
+   280→        ? `${((scaleMaxM ?? 0.05) * 1000).toFixed(0)} mm/yr away`
+   281→        : `${((scaleMaxM ?? 0.05) * 100).toFixed(0)} cm away`
+   282→      : layer === 'coherence'
+   283→        ? 'strong signal'
+   284→        : 'high';
+   285→  const title =
+   286→    layer === 'displacement' || isVel
+   287→      ? isVel
+   288→        ? 'LOS velocity (sustained motion)'
+   289→        : 'Movement toward / away from the satellite'
+   290→      : layer === 'coherence'
+   291→        ? 'Signal quality (coherence)'
+   292→        : 'Measurement uncertainty';
+   293→  return (
+   294→    <div className="absolute bottom-3 left-3 z-[500] rounded-lg border bg-white/95 px-3 py-2 shadow-sm">
+   295→      <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[#8A837B]">{title}</div>
+   296→      <div className="flex items-center gap-2">
+   297→        <span className="font-mono text-[10px] text-[#6F6862]">{left}</span>
+   298→        <div className="relative h-2 w-32">
+   299→          <div className="absolute inset-0 rounded-sm border border-[#E7E2DA]" style={{ background: gradient }} />
+   300→          {(layer === 'displacement' || isVel) && (
+   301→            <div className="absolute inset-y-0 left-1/2 w-px bg-[#4A443C]/60" aria-hidden />
+   302→          )}
+   303→        </div>
+   304→        <span className="font-mono text-[10px] text-[#6F6862]">{right}</span>
+   305→      </div>
+   306→      <div className="mt-1 text-[10px] text-[#8A837B]">
+   307→        {layer === 'displacement' || isVel
+   308→          ? isVel
+   309→            ? 'brown = moving toward the satellite · green = away from it · pale = stable'
+   310→            : 'brown = moved toward the satellite (mostly rising) · green = away (mostly sinking) · pale = little or no change'
+   311→          : layer === 'coherence'
+   312→            ? 'darker = more reliable measurement'
+   313→            : 'darker = more uncertain measurement'}
+   314→      </div>
+   315→      {(layer === 'displacement' || isVel) && (
+   316→        <div className="mt-0.5 text-center font-mono text-[9.5px] text-[#8A837B]">0 = no change</div>
+   317→      )}
+   318→    </div>
+   319→  );
+   320→}
+   321→
+   322→function HelpHeading({ children }: { children: React.ReactNode }) {
+   323→  return <h4 className="mt-3 text-[11px] font-semibold uppercase tracking-[0.06em] text-[#8A837B]">{children}</h4>;
+   324→}
+   325→
+   326→/**
+   327→ * Plain-language explainer for the map — written for someone who has never
+   328→ * heard of radar interferometry. One short answer per question a first-time
+   329→ * visitor asks: what is the picture, what does the divider do, when were the
+   330→ * data taken, what do the colors mean, and what is this NOT.
+   331→ */
+   332→function WhatAmISeeing({
+   333→  beforeAfter,
+   334→  layer,
+   335→  wavelengthM,
+   336→}: {
+   337→  beforeAfter: BeforeAfterInfo | null;
+   338→  layer: LayerKind;
+   339→  wavelengthM?: number;
+   340→}) {
+   341→  const swipe = !!beforeAfter;
+   342→  const prediction = beforeAfter?.prediction ?? false;
+   343→  let colors: React.ReactNode;
+   344→  if (layer === 'displacement' || layer === 'velocity') {
+   345→    colors = (
+   346→      <>
+   347→        <span className="font-semibold text-[#7A4A2B]">Brown</span> — that patch of ground moved{' '}
+   348→        <em>toward</em> the satellite (mostly rising).{' '}
+   349→        <span className="font-semibold text-[#2F5D53]">Green</span> — it moved <em>away</em> (mostly sinking).
+   350→        Pale means little or no change.
+   351→      </>
+   352→    );
+   353→  } else if (layer === 'detected') {
+   354→    colors = (
+   355→      <>
+   356→        Solid color marks only the areas where the measured change is bigger than the uncertainty — a real change
+   357→        with high confidence. <span className="font-semibold text-[#7A4A2B]">Brown</span> = ground rose,{' '}
+   358→        <span className="font-semibold text-[#2F5D53]">green</span> = ground sank. Nothing else is colored.
+   359→      </>
+   360→    );
+   361→  } else if (layer === 'coherence') {
+   362→    colors = <>Darker areas have a stronger, more reliable radar signal. Very light areas could not be measured at all (open water, dense forest…).</>;
+   363→  } else if (layer === 'sigma') {
+   364→    colors = <>Darker = more uncertain measurement. A change smaller than this cannot be told apart from noise.</>;
+   365→  } else if (layer === 'phase') {
+   366→    const half = wavelengthM ? (wavelengthM / 2 * 100).toFixed(1) : '12';
+   367→    colors = (
+   368→      <>
+   369→        The raw radar measurement drawn as color fringes, like contour lines on a hiking map — each full color cycle
+   370→        represents ≈ {half} cm of ground movement. The plain movement map is computed from this. Advanced view; you
+   371→        don&rsquo;t need it to understand the result.
+   372→      </>
+   373→    );
+   374→  } else {
+   375→    colors = <>Gray shows where a valid measurement exists. Transparent areas were excluded — no reliable signal there.</>;
+   376→  }
+   377→  const H = HelpHeading;
+   378→  return (
+   379→    <div className="max-h-[65vh] overflow-y-auto px-4 py-3.5">
+   380→      <div className="flex items-center gap-2 text-[13px] font-semibold text-[#1C1A17]">
+   381→        <HelpCircle className="h-4 w-4 text-[#7A6438]" aria-hidden />
+   382→        What am I seeing?
+   383→      </div>
+   384→      {swipe ? (
+   385→        <>
+   386→          <H>The picture</H>
+   387→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   388→            A satellite photo of the study area — the <strong>same photo on both sides</strong> of the divider, so you can
+   389→            recognize coastlines, rivers and cities. The divider doesn&rsquo;t move the map: it reveals the layer that
+   390→            was computed from radar.
+   391→          </p>
+   392→          <H>The two dates</H>
+   393→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   394→            NASA&rsquo;s radar satellite passed over this area twice —{' '}
+   395→            <strong>{fmtDay(beforeAfter?.refTime ?? '')}</strong> and <strong>{fmtDay(beforeAfter?.secTime ?? '')}</strong>. The
+   396→            analysis compares those two radar snapshots and measures how the ground changed in between.
+   397→          </p>
+   398→          <H>The colors</H>
+   399→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">{colors}</p>
+   400→          <H>What this is not</H>
+   401→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   402→            {prediction ? (
+   403→              <>
+   404→                Not a measurement of this event: the colored layer is what a physics model <em>predicts</em> from the
+   405→                published USGS fault mechanism — clearly labelled as a prediction. The photo behind it is a multi-date
+   406→                satellite composite (Esri).
+   407→              </>
+   408→            ) : (
+   409→              <>
+   410→                Not a photo of the change itself. The photo is a multi-date satellite composite (Esri); the colored layer
+   411→                is computed from the two radar scans. Transparent areas were not measured.
+   412→              </>
+   413→            )}
+   414→          </p>
+   415→          <H>Try this</H>
+   416→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   417→            Drag the round handle (or focus it and use ← → keys). Move the mouse over the map to read exact values.
+   418→            For the plainest highlight of changed areas, switch the layer tabs below the map to{' '}
+   419→            <strong>Detected change</strong>.
+   420→          </p>
+   421→        </>
+   422→      ) : (
+   423→        <>
+   424→          <H>The picture</H>
+   425→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   426→            A satellite photo of the study area with a colored measurement layer on top.
+   427→          </p>
+   428→          <H>The colors</H>
+   429→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">{colors}</p>
+   430→          <H>What this is not</H>
+   431→          <p className="mt-1 text-[12px] leading-[1.5rem] text-[#4A443C]">
+   432→            Not a photo of the change itself — the colored layer is computed from radar scans, the photo behind it is a
+   433→            multi-date satellite composite (Esri).
+   434→          </p>
+   435→        </>
+   436→      )}
+   437→    </div>
+   438→  );
+   439→}
+   440→
+   441→export default function MapPanel(props: MapPanelProps) {
+   442→  const { dataset, grids, gridsMeta, layer, opacity, events, primaryEvent, granulePolys, beforeAfter, wavelengthM, swipe } = props;
+   443→  const [overlay, setOverlay] = useState<RenderedOverlay | null>(null);
+   444→  const [rendering, setRendering] = useState(false);
+   445→  const [swipeX, setSwipeX] = useState(50);
+   446→  const containerRef = useRef<HTMLDivElement | null>(null);
+   447→  const draggingRef = useRef(false);
+   448→  const overlayInstanceRef = useRef<L.ImageOverlay | null>(null);
+   449→  const mapRef = useRef<L.Map | null>(null);
+   450→  const [hintOpen, setHintOpen] = useState(false);
+   451→  const [hintSeen, setHintSeen] = useState(true); // SSR-safe: hidden until mounted
+   452→  const swipeActive = !!swipe && !!beforeAfter;
+   453→
+   454→  // The one-time "drag to compare" bubble: shows once per browser session,
+   455→  // disappears after the first drag or 12 s.
+   456→  const dismissHint = useCallback(() => {
+   457→    setHintSeen(true);
+   458→    try {
+   459→      sessionStorage.setItem('motus.swipe-hint', '1');
+   460→    } catch {
+   461→      /* private mode — ignore */
+   462→    }
+   463→  }, []);
+   464→  useEffect(() => {
+   465→    try {
+   466→      setHintSeen(sessionStorage.getItem('motus.swipe-hint') === '1');
+   467→    } catch {
+   468→      setHintSeen(false);
+   469→    }
+   470→  }, []);
+   471→  useEffect(() => {
+   472→    if (!swipeActive || hintSeen) return;
+   473→    const t = setTimeout(dismissHint, 12000);
+   474→    return () => clearTimeout(t);
+   475→  }, [swipeActive, hintSeen, dismissHint]);
+   476→
+   477→  // Overlay rendering (Mercator-exact warp) with a paint-friendly deferral.
+   478→  useEffect(() => {
+   479→    if (!grids || !gridsMeta) {
+   480→      setOverlay(null);
+   481→      return;
+   482→    }
+   483→    setRendering(true);
+   484→    const t = setTimeout(() => {
+   485→      try {
+   486→        const ov = renderOverlay(grids, gridsMeta, layer, undefined, 1024, wavelengthM);
+   487→        setOverlay(ov ?? null);
+   488→      } catch (e) {
+   489→        console.error('[motus-overlay] render failed', e);
+   490→        setOverlay(null);
+   491→      } finally {
+   492→        setRendering(false);
+   493→      }
+   494→    }, 10);
+   495→    return () => clearTimeout(t);
+   496→  }, [grids, gridsMeta, layer, wavelengthM]);
+   497→
+   498→  // ---- Pixel-exact swipe clip ---------------------------------------------------
+   499→  // The reveal edge must sit exactly under the divider handle at any zoom,
+   500→  // pan and overlay geometry. Percentages resolve against the image element's
+   501→  // own (moving) box — so the clip is computed in PIXELS in Leaflet's layer
+   502→  // coordinate space and re-applied on every map interaction.
+   503→  const applyClip = useCallback(() => {
+   504→    const map = mapRef.current;
+   505→    const img = overlayInstanceRef.current?.getElement() ?? null;
+   506→    if (!map || !img) return;
+   507→    if (!swipeActive) {
+   508→      img.style.clipPath = '';
+   509→      return;
+   510→    }
+   511→    const rect = map.getContainer().getBoundingClientRect();
+   512→    const px = (swipeX / 100) * rect.width;
+   513→    const layerX = map.containerPointToLayerPoint([px, 0]).x;
+   514→    const imgX = L.DomUtil.getPosition(img).x;
+   515→    const edge = Math.max(0, layerX - imgX);
+   516→    img.style.clipPath = `inset(0px 0px 0px ${edge}px)`;
+   517→  }, [swipeActive, swipeX]);
+   518→  const applyClipRef = useRef(applyClip);
+   519→  applyClipRef.current = applyClip;
+   520→
+   521→  // Re-apply whenever the clip inputs change (drag, overlay swap, mode toggle).
+   522→  useEffect(() => {
+   523→    if (!swipeActive) return;
+   524→    const raf = requestAnimationFrame(() => applyClipRef.current());
+   525→    return () => cancelAnimationFrame(raf);
+   526→  }, [swipeActive, swipeX, overlay, layer]);
+   527→
+   528→  // Dev-only handle for E2E pan/zoom verification of the clip alignment.
+   529→  useEffect(() => {
+   530→    if (process.env.NODE_ENV !== 'production') {
+   531→      (window as unknown as { __motusMap?: L.Map | null }).__motusMap = mapRef.current;
+   532→    }
+   533→  });
+   534→
+   535→  // Divider dragging: pointer events with capture + keyboard support.
+   536→  const onPointerMove = useCallback((e: React.PointerEvent) => {
+   537→    if (!draggingRef.current || !containerRef.current) return;
+   538→    const rect = containerRef.current.getBoundingClientRect();
+   539→    const x = ((e.clientX - rect.left) / rect.width) * 100;
+   540→    setSwipeX(Math.min(98.5, Math.max(1.5, x)));
+   541→  }, []);
+   542→  const stopDrag = useCallback(() => {
+   543→    draggingRef.current = false;
+   544→    window.removeEventListener('pointermove', onPointerMove as unknown as EventListener);
+   545→    window.removeEventListener('pointerup', stopDrag);
+   546→    window.removeEventListener('pointercancel', stopDrag);
+   547→  }, [onPointerMove]);
+   548→  const startDrag = useCallback(
+   549→    (e: React.PointerEvent) => {
+   550→      draggingRef.current = true;
+   551→      setHintSeen(true);
+   552→      try {
+   553→        sessionStorage.setItem('motus.swipe-hint', '1');
+   554→      } catch {
+   555→        /* ignore */
+   556→      }
+   557→      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+   558→      window.addEventListener('pointermove', onPointerMove as unknown as EventListener);
+   559→      window.addEventListener('pointerup', stopDrag);
+   560→      window.addEventListener('pointercancel', stopDrag);
+   561→      if (e.currentTarget instanceof HTMLElement) e.currentTarget.focus({ preventScroll: true });
+   562→    },
+   563→    [onPointerMove, stopDrag],
+   564→  );
+   565→
+   566→  const footprint: [number, number][] = useMemo(
+   567→    () => (dataset.footprintPolygon ?? []).map(([lon, lat]) => [lat, lon] as [number, number]),
+   568→    [dataset.footprintPolygon],
+   569→  );
+   570→
+   571→  return (
+   572→    <div
+   573→      ref={containerRef}
+   574→      className="relative overflow-hidden rounded-xl border border-[#E7E2DA] bg-white"
+   575→      style={{ minHeight: 420 }}
+   576→      role="region"
+   577→      aria-label="Study area map"
+   578→    >
+   579→      <MapContainer
+   580→        ref={mapRef}
+   581→        center={[dataset.center?.lat ?? 0, dataset.center?.lon ?? 0]}
+   582→        zoom={dataset.center ? 8 : 2}
+   583→        style={{ height: '100%', minHeight: 420, position: 'absolute', inset: 0 }}
+   584→        zoomControl={false}
+   585→        attributionControl={true}
+   586→      >
+   587→        <ZoomControls belowChip={swipeActive} />
+   588→        {/* Real satellite imagery in every mode — the default (pre-analysis)
+   589→            view gets the same realism and terrain depth as the result view. */}
+   590→        <TileLayer
+   591→          url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+   592→          attribution="Imagery &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics"
+   593→        />
+   594→        {/* Sparse place names + boundaries over the imagery, so coastlines,
+   595→            cities and borders stay recognizable without a flat street map. */}
+   596→        <TileLayer
+   597→          url="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+   598→          attribution="Labels &copy; Esri"
+   599→        />
+   600→        <ScaleControl position="bottomright" metric={true} imperial={false} />
+   601→        <FitBounds polygon={footprint} />
+   602→        <ClipSync clipRef={applyClipRef} />
+   603→        {overlay && (
+   604→          <ImageOverlay
+   605→            ref={overlayInstanceRef as never}
+   606→            url={overlay.dataUrl}
+   607→            bounds={[[overlay.geo.latMin, overlay.geo.lonMin], [overlay.geo.latMax, overlay.geo.lonMax]]}
+   608→            opacity={opacity}
+   609→          />
+   610→        )}
+   611→          {/* Footprint: soft dark casing under a white line, so the frame
+   612→              reads on bright desert, dark ocean and colored overlays alike. */}
+   613→          <Polygon
+   614→            positions={footprint.length > 2 ? footprint : []}
+   615→            pathOptions={{ color: '#1C1A17', weight: 3.5, opacity: 0.55, fill: false, interactive: false }}
+   616→          />
+   617→          <Polygon
+   618→            positions={footprint.length > 2 ? footprint : []}
+   619→            pathOptions={{ color: '#FFFFFF', weight: 1.5, fillColor: '#FFFFFF', fillOpacity: 0.05 }}
+   620→          />
+   621→        {granulePolys?.map(({ granule, poly }) => (
+   622→          <Polygon
+   623→            key={granule.granuleId}
+   624→            positions={poly.map(([lon, lat]) => [lat, lon] as [number, number])}
+   625→            pathOptions={{ color: '#B08D57', weight: 1, dashArray: '4 3', fillOpacity: 0.02 }}
+   626→          >
+   627→            <Tooltip>{granule.granuleId.slice(0, 52)}…</Tooltip>
+   628→          </Polygon>
+   629→        ))}
+   630→        {events.map((ev) => {
+   631→          const primary = primaryEvent && ev.id === primaryEvent.id;
+   632→          return (
+   633→            <CircleMarker
+   634→              key={ev.id}
+   635→              center={[ev.lat, ev.lon]}
+   636→              radius={4 + Math.max(0, ev.magnitude - 4) * 2.2}
+   637→              pathOptions={{
+   638→                color: primary ? '#6E2418' : '#9E3B2C',
+   639→                weight: primary ? 2.5 : 1,
+   640→                fillColor: '#9E3B2C',
+   641→                fillOpacity: 0.8,
+   642→              }}
+   643→            >
+   644→              <Tooltip>
+   645→                <div className="text-[11px] leading-4">
+   646→                  <div className="font-semibold">M{ev.magnitude.toFixed(1)} {ev.magType ?? ''}</div>
+   647→                  <div>{ev.place}</div>
+   648→                  <div>{ev.time.slice(0, 16).replace('T', ' ')} UTC · depth {ev.depthKm.toFixed(0)} km</div>
+   649→                  <a href={ev.url} target="_blank" rel="noopener noreferrer" className="underline">
+   650→                    USGS event page
+   651→                  </a>
+   652→                </div>
+   653→              </Tooltip>
+   654→            </CircleMarker>
+   655→          );
+   656→        })}
+   657→        <HoverReadout grids={grids ?? null} gridsMeta={gridsMeta} layer={layer} wavelengthM={wavelengthM} />
+   658→      </MapContainer>
+   659→
+   660→      {/* ---- Before / After swipe chrome ---- */}
+   661→      {swipeActive && beforeAfter && (
+   662→        <>
+   663→          <div
+   664→            className="pointer-events-none absolute inset-y-0 z-[540]"
+   665→            style={{ left: `${swipeX}%` }}
+   666→            aria-hidden
+   667→          >
+   668→            <div className="absolute inset-y-0 -left-px w-0.5 bg-white shadow-[0_0_6px_rgba(28,26,23,0.65)]" />
+   669→          </div>
+   670→          <div
+   671→            className="absolute inset-y-0 z-[560] w-9 -translate-x-1/2 cursor-ew-resize"
+   672→            style={{ left: `${swipeX}%`, touchAction: 'none' }}
+   673→            role="slider"
+   674→            tabIndex={0}
+   675→            aria-label="Before/after divider position"
+   676→            aria-valuemin={0}
+   677→            aria-valuemax={100}
+   678→            aria-valuenow={Math.round(swipeX)}
+   679→            onPointerDown={startDrag}
+   680→            onPointerUp={stopDrag}
+   681→            onPointerMove={onPointerMove}
+   682→            onKeyDown={(e) => {
+   683→              if (e.key === 'ArrowLeft') { setHintSeen(true); setSwipeX((x) => Math.max(1.5, x - 2)); }
+   684→              if (e.key === 'ArrowRight') { setHintSeen(true); setSwipeX((x) => Math.min(98.5, x + 2)); }
+   685→            }}
+   686→          >
+   687→            <div className="absolute left-1/2 top-1/2 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-[#E7E2DA] bg-white shadow-[0_2px_10px_rgba(28,26,23,0.35)]">
+   688→              <ChevronsLeftRight className="h-4 w-4 text-[#1C1A17]" aria-hidden />
+   689→            </div>
+   690→          </div>
+   691→          {!hintSeen && (
+   692→            <div
+   693→              className="pointer-events-none absolute top-1/2 z-[555] -translate-y-1/2 animate-pulse whitespace-nowrap rounded-full bg-[#1C1A17]/90 px-3 py-1.5 text-[11px] font-medium text-white shadow-md"
+   694→              style={
+   695→                swipeX > 60
+   696→                  ? { right: `calc(${100 - swipeX}% + 26px)` }
+   697→                  : { left: `calc(${swipeX}% + 26px)` }
+   698→              }
+   699→            >
+   700→              ← drag to compare →
+   701→            </div>
+   702→          )}
+   703→          <div
+   704→            className="pointer-events-none absolute left-3 top-3 z-[550] flex items-center gap-1.5 rounded-md bg-[#1C1A17]/85 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-white backdrop-blur-sm"
+   705→          >
+   706→            <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#D8D2C6]" aria-hidden />
+   707→            Before · <span className="sm:hidden">{fmtDayShort(beforeAfter.refTime)}</span>
+   708→            <span className="hidden sm:inline">{fmtDay(beforeAfter.refTime)}</span>
+   709→          </div>
+   710→          <div
+   711→            className="pointer-events-none absolute right-3 top-3 z-[550] flex items-center gap-1.5 rounded-md bg-[#1C1A17]/85 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-white backdrop-blur-sm"
+   712→          >
+   713→            <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#B08D57]" aria-hidden />
+   714→            After · <span className="sm:hidden">{fmtDayShort(beforeAfter.secTime)}</span>
+   715→            <span className="hidden sm:inline">{fmtDay(beforeAfter.secTime)}</span>
+   716→            <span className="hidden sm:inline">+ {beforeAfter.prediction ? 'model prediction' : 'measured change'}</span>
+   717→          </div>
+   718→        </>
+   719→      )}
+   720→
+   721→      {/* ---- Plain-language "What am I seeing?" helper ---- */}
+   722→      {grids && (
+   723→        <Popover open={hintOpen} onOpenChange={setHintOpen}>
+   724→          <PopoverTrigger asChild>
+   725→            <button
+   726→              type="button"
+   727→              className={`absolute left-1/2 z-[555] flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[#E7E2DA] bg-white/95 px-3 py-1.5 text-[11px] font-medium text-[#1C1A17] shadow-sm backdrop-blur-sm transition-colors hover:bg-white ${swipeActive ? 'top-11' : 'top-3'}`}
+   728→              aria-label="What am I seeing? Plain-language explanation of this map"
+   729→            >
+   730→              <HelpCircle className="h-3.5 w-3.5 text-[#7A6438]" aria-hidden />
+   731→              What am I seeing?
+   732→            </button>
+   733→          </PopoverTrigger>
+   734→          <PopoverContent align="center" side="bottom" className="w-[320px] p-0 sm:w-[380px]">
+   735→            <WhatAmISeeing beforeAfter={swipeActive ? beforeAfter : null} layer={layer} wavelengthM={wavelengthM} />
+   736→          </PopoverContent>
+   737→        </Popover>
+   738→      )}
+   739→
+   740→      {dataset.availability.state !== 'available' && (
+   741→        <div className="pointer-events-none absolute inset-x-0 top-1/2 z-[500] -translate-y-1/2 px-6 text-center">
+   742→          <p className="mx-auto max-w-md rounded-lg border border-[#E5C4B7] bg-[#FBF3EF]/95 px-4 py-3 text-[12px] leading-[1.4rem] text-[#9E3B2C]">
+   743→            The data for this area have not been downloaded to this server, so there is nothing to
+   744→            show on the map yet. The panel alongside explains how to obtain them.
+   745→          </p>
+   746→        </div>
+   747→      )}
+   748→      {overlay && <Legend layer={layer} scaleMaxM={overlay.scaleMaxM} wavelengthM={wavelengthM} />}
+   749→      {rendering && (
+   750→        <div className="absolute right-3 top-14 z-[500] rounded-md border bg-white/95 px-2.5 py-1 text-[11px] text-[#6F6862] shadow-sm">
+   751→          Drawing the layer…
+   752→        </div>
+   753→      )}
+   754→    </div>
+   755→  );
+   756→}
+   757→

@@ -202,11 +202,40 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
                 <li>Fault placement is calibrated against the 2D analytic screw-dislocation solution; slip senses (sinistral U1⁺, normal U2⁺, opening U3⁺) are verified by trace-jump tests.</li>
                 <li>Synthetic earthquakes are recovered end-to-end to ≈ 2.6 mm MAE against analytic ground truth; the null fixture produces zero false alarms.</li>
                 <li>The stack pipeline grades itself against known synthetic truth: velocity RMSE ~34 mm/yr, coseismic step recovered to ~98% of its amplitude at the correct epoch, GNSS LOS-projection RMSE ~33 mm/yr over 9 stations, Brier score ~0.16 vs the plan&apos;s 0.15 target.</li>
-                <li>Automated tests cover conventions, geodesy, validation gates, the SBAS solver, PELT change points and the Bayesian engine.</li>
+                <li>Tsunami solver: lake-at-rest (incl. wet/dry) to machine precision (≤ 3e-14 m/s), dam-break mass conservation 4.6e-15 relative, linear wave speed within 3% of √(gh), order-2 grid convergence, detection false-alarm 0/12 on synthetic controls; real-data hindcasts against archived NOAA DART records (Tōhoku 2011, Maule 2010) are recorded in docs/validation.md.</li>
+                <li>Automated tests cover conventions, geodesy, validation gates, the SBAS solver, PELT change points, the Bayesian engine, and the tsunami stack (46 tests).</li>
               </ul>
               <p className="text-[11.5px] italic text-[#8A837B]">
                 A passing software test is not equivalent to scientific validation — see docs/validation.md for what
                 remains unvalidated.
+              </p>
+            </Section>
+
+            <Section n={9} title="Tsunami capability (physics + evidence)">
+              <p>
+                The tsunami workflow keeps measurement, model and attribution separate, exactly like the radar side.
+                Real NOAA DART bottom-pressure records are de-tided (robust local quadratic fit, MAD-scaled noise,
+                5σ trigger with a documented seismic-phase mask) — a trigger is a detection, not a verdict.
+              </p>
+              <p className="mt-2 font-medium text-[#4A443C]">Model chain (all steps unit-tested):</p>
+              <ul className="list-inside list-disc space-y-1">
+                <li>Source: USGS finite-fault subfaults (or MT plane + Wells–Coppersmith scaling, labelled approximation) → Okada dislocations summed on the ETOPO1 grid.</li>
+                <li>Corrections: Tanioka–Seno bathymetric-slope term <Eq>Δh = u_z + u_h·∇b</Eq>; Kajiura water-column transfer <Eq>η̂(k) = Δĥ(k)/cosh(k·d)</Eq>.</li>
+                <li>Propagation: 2-D nonlinear shallow-water equations, well-balanced hydrostatic-reconstruction finite volumes (Audusse et al. 2004), HLL fluxes with dry-front speeds (George 2008), MUSCL + SSP-RK2, positivity-preserving wet/dry, Manning friction, sponge boundaries, CFL ≤ 0.45 with the 2-D sum form.</li>
+                <li>Independent check: eikonal travel-time field ‖∇T‖ = 1/√(gh) by fast sweeping (Zhao 2005).</li>
+              </ul>
+              <p className="mt-2 font-medium text-[#4A443C]">Evidence levels (never conflated):</p>
+              <ul className="list-inside list-disc space-y-1">
+                <li>insufficient — no usable sensor record in range (missing ≠ absent)</li>
+                <li>none-detected — sensors with coverage show nothing above 5σ</li>
+                <li>possible — screening heuristic met and/or a trigger without a consistent simulation</li>
+                <li>consistent — trigger(s) agree with the simulation within documented tolerances (±15 min, ×3 amplitude); buoys sample one wave field — correlated, not independent</li>
+                <li>confirmed-official — only ever a citation to an authoritative external page</li>
+              </ul>
+              <p className="mt-2 text-[11.5px] italic text-[#8A837B]">
+                Known limits (also shown inline with every result): ETOPO1 cells (~2–7 km) cannot resolve coastal
+                inundation; dispersion and Coriolis are not modelled (regional approximation); no ensemble → no error
+                bars; station positions are current deployments. Full details: docs/tsunami.md.
               </p>
             </Section>
 

@@ -22,6 +22,117 @@ export interface ScienceReference {
 }
 
 export const REFERENCES: ScienceReference[] = [
+  // ---------------- tsunami capability (2026-10-24) ----------------
+  {
+    key: 'audusse2004',
+    title: 'A fast and stable well-balanced scheme with hydrostatic reconstruction for shallow water flows',
+    authors: 'E. Audusse, F. Bouchut, M.-O. Bristeau, R. Klein, B. Perthame',
+    year: 2004,
+    venue: 'SIAM Journal on Scientific Computing 25(6):2050–2065',
+    url: 'https://doi.org/10.1137/S1064827503431097',
+    doi: '10.1137/S1064827503431097',
+    type: 'paper',
+    supports: [
+      'Hydrostatic reconstruction + double-sided pressure correction that makes the NSWE finite-volume solver exactly well-balanced (lake at rest incl. wet/dry), verified to machine precision in tests',
+    ],
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'george2008',
+    title: 'Augmented Riemann solvers for the shallow water equations over variable bed topography',
+    authors: 'D. L. George',
+    year: 2008,
+    venue: 'PhD thesis, University of Washington',
+    url: 'https://www.clawpack.org/george-2008/',
+    type: 'paper',
+    supports: [
+      'Dry-front wave-speed treatment (|u|+2√(gh) for cells bordering dry neighbours) used in the HLL fluxes and the CFL condition',
+    ],
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'kajiura1963',
+    title: 'The leading wave of a tsunami',
+    authors: 'K. Kajiura',
+    year: 1963,
+    venue: 'Bulletin of the Earthquake Research Institute 41:535–571',
+    url: 'https://www.jstage.jst.go.jp/article/sokuchi1932/41/3/41_3_535/_article',
+    type: 'paper',
+    supports: [
+      'Water-column transfer function η̂(k) = Δĥ(k)/cosh(k·d) applied to the seafloor displacement before the initial condition',
+    ],
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'taniokaseno1997',
+    title: 'Sediment effect on tsunami generation of the 1896 Sanriku tsunami earthquake',
+    authors: 'K. Tanioka, T. Seno',
+    year: 1997,
+    venue: 'Geophysical Research Letters 24(4):541–548',
+    url: 'https://doi.org/10.1029/97GL04018',
+    doi: '10.1029/97GL04018',
+    type: 'paper',
+    supports: [
+      'Bathymetric-slope correction Δh = u_z + u_h·∇b added to the Okada vertical displacement',
+    ],
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'zhao2005',
+    title: 'A fast sweeping method for eikonal equations',
+    authors: 'H. Zhao',
+    year: 2005,
+    venue: 'Mathematics of Computation 74(250):603–627',
+    url: 'https://doi.org/10.1090/S0025-5718-04-01678-3',
+    doi: '10.1090/S0025-5718-04-01678-3',
+    type: 'paper',
+    supports: [
+      'Gauss–Seidel fast-sweeping solver for the travel-time eikonal equation ‖∇T‖ = 1/√(gh)',
+    ],
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'etopo1',
+    title: 'ETOPO1 1 Arc-Minute Global Relief Model',
+    authors: 'C. Amante, B. W. Eakins (NOAA NCEI)',
+    year: 2009,
+    venue: 'NOAA National Centers for Environmental Information',
+    url: 'https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO1/',
+    type: 'dataset',
+    supports: [
+      'Bathymetry/topography for all tsunami simulations, subset live via the NCEI THREDDS OPeNDAP service (verified 8°×6° in ≈4 s)',
+    ],
+    note: 'MSL vertical datum; ~1.8 km cells at best — coastal inundation is not resolved (UI carries the caveat)',
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'ndbc-dart',
+    title: 'NDBC DART® (Deep-ocean Assessment and Reporting of Tsunamis) data archive',
+    authors: 'NOAA National Data Buoy Center',
+    year: 2026,
+    venue: 'ndbc.noaa.gov/data/historical/dart/ + /data/realtime2/',
+    url: 'https://www.ndbc.noaa.gov/dart.shtml',
+    type: 'dataset',
+    supports: [
+      'Deep-ocean bottom-pressure records for the observation check (15-min monitor / 1-min event cadence, 9999.0 = missing)',
+    ],
+    note: 'station positions are current deployments — buoys are redeployed over the years; historical comparisons carry this caveat',
+    checkedAt: '2026-10-24',
+  },
+  {
+    key: 'hayes2017ffm',
+    title: 'The finite-fault slip model of the USGS Earthquake Hazard Program',
+    authors: 'G. P. Hayes (USGS NEIC)',
+    year: 2017,
+    venue: 'USGS Earthquake Hazards Program',
+    url: 'https://earthquake.usgs.gov/data/finitefault/',
+    type: 'dataset',
+    supports: [
+      'Finite-fault subfault geometries + slip (FFM.geojson products) used to build the initial condition when published',
+    ],
+    checkedAt: '2026-10-24',
+  },
+
   {
     key: 'okada1985',
     title: 'Surface deformation due to shear and tensile faults in a half-space',
