@@ -179,6 +179,14 @@ export interface TransportGrid {
   mask: string;
   /** One-sigma per-pixel uncertainty in metres, base64 Float32 */
   sigma: string;
+  /**
+   * Detected-change mask (2026-10-24): 1 = the exact server-side detection
+   * rule (|d| > max(k·σ, floor)) passes for the majority of contributing
+   * full-resolution pixels, 0 = not detected. Base64 Uint8. Optional because
+   * prediction/velocity transports carry no detection rule — the client
+   * decodes a zero-filled grid when absent.
+   */
+  detected?: string;
   meta: GridMeta;
 }
 

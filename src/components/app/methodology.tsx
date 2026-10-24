@@ -150,9 +150,13 @@ export function MethodologyDrawer({ trigger }: { trigger: React.ReactNode }) {
 
             <Section n={6} title="Time-series stack pipeline (the research plan core)">
               <p>
-                For stack datasets the full system plan runs end-to-end. Twenty-one acquisitions on the 12-day repeat
-                cycle (the documented 2026-07-27…08-10 NISAR instrument gap is honoured) form 24 interferograms. The
-                unwrapped phase of interferogram k between epochs a and b is modelled as
+                The stack machinery is real and exercised end-to-end by the automated test suite and the{' '}
+                <code className="font-mono text-[11px]">/api/v1</code> plan-spec endpoints on a synthetic validation
+                stack with known truth. It is deliberately <strong>not offered as a study area</strong> in the UI: a real
+                24-granule GUNW stack is ≈ 60 GB of Earthdata-gated products that this deployment has not ingested, and
+                listing a synthetic stack as if it were a place on Earth would misrepresent it. Twenty-one acquisitions
+                on the 12-day repeat cycle (the documented 2026-07-27…08-10 NISAR instrument gap is honoured) form 24
+                interferograms. The unwrapped phase of interferogram k between epochs a and b is modelled as
               </p>
               <Eq>φ_k = (4π/λ) · Σ_j B[k,j] · v_j · Δt_j</Eq>
               <p>

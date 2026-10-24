@@ -50,6 +50,7 @@ import type { LayerKind } from '@/components/app/raster-render';
 import { renderOverlay } from '@/components/app/raster-render';
 import { decodeTransport, b64ToFloat32, b64ToUint8, type DecodedGrids } from '@/components/app/decode';
 import { toGeoTiff, toCsv, downloadBlob, fileStem } from '@/components/app/export';
+import { TokenPasteBox } from '@/components/app/token-paste-box';
 
 const MapPanel = dynamic(() => import('@/components/app/map-panel'), {
   ssr: false,
@@ -83,7 +84,6 @@ const DEFAULT_ADVANCED: AdvancedParams = {
  */
 function readinessRank(d: DatasetListEntry): number {
   if (d.availability.state !== 'available') return d.availability.recorded ? 1.5 : 3;
-  if (d.dataClass === 'synthetic') return 2;
   if (d.mode === 'evidence') return 1;
   return 0;
 }
@@ -111,13 +111,15 @@ function processingStages(mode: 'quantitative' | 'evidence'): Array<{ label: str
 }
 
 function layerLabel(l: LayerKind, isPrediction: boolean, isSbas = false): string {
-  if (l === 'velocity') return 'Velocity (mm/yr)';
+  if (l === 'velocity') return 'Yearly motion';
   if (l === 'displacement') {
     if (isPrediction) return 'Model prediction';
     if (isSbas) return 'Cumulative movement';
-    return 'Measured movement';
+    return 'Where the ground moved';
   }
-  if (l === 'coherence') return isSbas ? 'Temporal coherence' : 'Signal quality';
+  if (l === 'detected') return 'Detected change';
+  if (l === 'phase') return 'Radar phase (advanced)';
+  if (l === 'coherence') return 'Signal quality';
   if (l === 'sigma') return 'Uncertainty';
   return 'Measured areas';
 }
@@ -128,12 +130,18 @@ function layerInterpretation(l: LayerKind, isPrediction: boolean, isSbas = false
   }
   if (l === 'displacement') {
     if (isPrediction) {
-      return 'Colors show where a standard earthquake model predicts the ground should have moved. This is a calculation, not a measurement of this event.';
+      return 'Colors show where a standard earthquake model predicts the ground should have moved — brown = toward the satellite (mostly rising), green = away (mostly sinking). This is a calculation, not a measurement of this event.';
     }
     if (isSbas) {
       return 'Colors show the cumulative apparent line-of-sight movement from the first acquisition up to the selected epoch (drag the time slider). The subsidence bowls deepen steadily; the coseismic step appears at the event epoch.';
     }
-    return 'Colors show how far each patch of ground appears to have moved toward or away from the satellite between the two radar images. Areas without color could not be measured reliably.';
+    return 'Colors show how far each patch of ground appears to have moved toward or away from the satellite between the two radar images: brown = toward the satellite (mostly rising), green = away (mostly sinking). No color = could not be measured.';
+  }
+  if (l === 'detected') {
+    return 'Only the areas where the measured change is bigger than the uncertainty are colored — a real change with high confidence. Brown = the ground rose, green = it sank. Everything else is left uncolored on purpose.';
+  }
+  if (l === 'phase') {
+    return 'The raw radar measurement drawn as color fringes, like contour lines on a hiking map — each full color cycle represents one half-wavelength of ground movement. The plain movement map above is computed from this. Advanced view: you don\u2019t need it to understand the result.';
   }
   if (l === 'coherence') {
     return isSbas
@@ -176,6 +184,7 @@ export default function Home() {
   const [advanced, setAdvanced] = useState<AdvancedParams>(DEFAULT_ADVANCED);
   const [layer, setLayer] = useState<LayerKind>('displacement');
   const [opacity, setOpacity] = useState(0.85);
+  const [mapMode, setMapMode] = useState<'swipe' | 'single'>('swipe');
   const [grids, setGrids] = useState<DecodedGrids | null>(null);
   const [gridsMeta, setGridsMeta] = useState<Parameters<typeof import('@/components/app/raster-render').renderOverlay>[1] | undefined>(undefined);
   const [granulePolys, setGranulePolys] = useState<Array<{ granule: PanamaGranule; poly: [number, number][] }>>([]);
@@ -225,6 +234,7 @@ export default function Home() {
     setDetail(null);
     setRecordedRun(null);
     setLayer('displacement');
+    setMapMode('swipe');
     const suggestedCoh = datasets?.find((d) => d.id === selectedId)?.suggestedParams?.coherenceThreshold;
     setAdvanced((a) => ({
       ...a,
@@ -330,13 +340,16 @@ export default function Home() {
       const mask = b64ToUint8(sbasResult.cumulative.mask);
       const n = sbasResult.cumulative.meta.width * sbasResult.cumulative.meta.height;
       for (let i = 0; i < n; i++) if (!mask[i]) data[i] = NaN;
+      const vel = decodeTransport(sbasResult.velocity);
       setGrids({
         width: sbasResult.cumulative.meta.width,
         height: sbasResult.cumulative.meta.height,
         displacement: data,
-        coherence: decodeTransport(sbasResult.velocity).coherence,
+        coherence: vel.coherence,
         mask,
-        sigma: decodeTransport(sbasResult.velocity).sigma,
+        sigma: vel.sigma,
+        // No detection rule on cumulative stack epochs — zero-filled.
+        detected: new Uint8Array(n),
       });
       setGridsMeta(sbasResult.cumulative.meta);
     }
@@ -421,6 +434,55 @@ export default function Home() {
   const realCount = (datasets ?? []).filter((d) => d.dataClass === 'real').length;
   const liveCatalogs = !!health && (health.capabilities.liveUsgs || health.capabilities.liveCmr);
 
+  /* ---------------- Before/After swipe derivation ---------------- */
+
+  /** Radar wavelength from the dataset geometry (phase layer needs it). */
+  const wavelengthM = detail?.geometry?.wavelength;
+
+  /** Acquisition dates that bracket the measured change (enables the divider). */
+  const beforeAfter = useMemo(() => {
+    if (!detail || !grids) return null;
+    if (result && isSbasResult(result)) return null; // time-series stack: no single before/after pair
+    const { referenceTime, secondaryTime } = detail.provenance;
+    if (!referenceTime || !secondaryTime) return null;
+    return {
+      refTime: referenceTime,
+      secTime: secondaryTime,
+      prediction: detail.mode === 'evidence',
+    };
+  }, [detail, grids, result]);
+
+  const swipeDays = useMemo(
+    () =>
+      beforeAfter
+        ? Math.round(
+            Math.abs(new Date(beforeAfter.secTime).getTime() - new Date(beforeAfter.refTime).getTime()) / 86400000,
+          )
+        : null,
+    [beforeAfter],
+  );
+
+  /** The strongest earthquake that struck between the two radar passes. */
+  const windowQuake = useMemo(() => {
+    if (!beforeAfter || eventsForMap.length === 0) return null;
+    const t0 = new Date(beforeAfter.refTime).getTime();
+    const t1 = new Date(beforeAfter.secTime).getTime();
+    let best: (typeof eventsForMap)[number] | null = null;
+    for (const ev of eventsForMap) {
+      const t = Date.parse(ev.time);
+      if (!(t > t0 && t < t1)) continue;
+      if (!best || ev.magnitude > best.magnitude) best = ev;
+    }
+    return best;
+  }, [beforeAfter, eventsForMap]);
+
+  /** Layer tabs offered for the current result kind. */
+  const layerOptions = useMemo(() => {
+    if (sbasResult) return ['velocity', 'displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[];
+    if (beforeAfter?.prediction) return ['displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[];
+    return ['displacement', 'detected', 'phase', 'coherence', 'sigma', 'coverage'] as LayerKind[];
+  }, [sbasResult, beforeAfter]);
+
   /* ---------------- Exports (from the decoded grids, client-side) ---------------- */
 
   const currentLayerGrid = useCallback((): { data: Float32Array; name: string } | null => {
@@ -428,6 +490,12 @@ export default function Home() {
     if (layer === 'coherence') return { data: grids.coherence, name: 'coherence' };
     if (layer === 'sigma') return { data: grids.sigma, name: 'uncertainty' };
     if (layer === 'velocity') return { data: grids.displacement, name: 'los-velocity-m-per-yr' };
+    if (layer === 'detected') {
+      const d = new Float32Array(grids.detected.length);
+      for (let i = 0; i < grids.detected.length; i++) d[i] = grids.detected[i] ? 1 : NaN;
+      return { data: d, name: 'detected-change-mask' };
+    }
+    if (layer === 'phase') return { data: grids.displacement, name: 'los-phase-equivalent' };
     if (layer === 'coverage') {
       const m = new Float32Array(grids.mask.length);
       for (let i = 0; i < grids.mask.length; i++) m[i] = grids.mask[i] ? 1 : NaN;
@@ -461,7 +529,7 @@ export default function Home() {
   const exportPng = useCallback(() => {
     if (!grids || !gridsMeta) return;
     try {
-      const ov = renderOverlay(grids, gridsMeta, layer);
+      const ov = renderOverlay(grids, gridsMeta, layer, undefined, 1024, wavelengthM);
       if (!ov?.dataUrl) return;
       const a = document.createElement('a');
       a.href = ov.dataUrl;
@@ -472,7 +540,7 @@ export default function Home() {
     } catch (e) {
       console.error('[motus-export] png failed', e);
     }
-  }, [grids, gridsMeta, layer, selectedId, isPredictionLayer]);
+  }, [grids, gridsMeta, layer, selectedId, isPredictionLayer, wavelengthM]);
 
   const scrollToChoose = () => {
     document.getElementById('choose-area')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -543,7 +611,7 @@ export default function Home() {
               Take the guided tour
             </Button>
             <span className="text-[12px] text-[#8A837B]">
-              3 stories · about 2 minutes · drives the real page
+              3 real-data stories · about 3 minutes · drives the real page
             </span>
           </motion.div>
 
@@ -582,7 +650,7 @@ export default function Home() {
 
           <ol className="mt-7 grid gap-2 text-[12px] text-[#6F6862] sm:grid-cols-3 sm:gap-4" aria-label="How to use MOTUS">
             {[
-              ['1', 'Choose an area', 'Pick a study area below. Labels say whether the data are real, a demo, or unavailable.'],
+              ['1', 'Choose an area', 'Pick a study area below. Every area is real NASA data — labels say whether it is ready to analyze or unavailable.'],
               ['2', 'Analyze it', 'One click runs the full analysis. Advanced settings stay out of the way until you want them.'],
               ['3', 'Understand the result', 'What was found, how certain it is, what could explain it, and what it does not prove.'],
             ].map(([n, title, desc]) => (
@@ -678,9 +746,10 @@ export default function Home() {
                     </p>
                     {anyReady && (
                       <p className="mt-2 text-[12px] leading-[1.4rem] text-[#9E3B2C]">
-                        Tip: choose a <strong>Ready to analyze</strong> or <strong>Demo data</strong> area above — those work right now.
+                        Tip: choose a <strong>Ready to analyze</strong> area above — those work right now.
                       </p>
                     )}
+                    <TokenPasteBox datasetTitle={detail.title} />
                   </div>
                 )}
 
@@ -702,6 +771,7 @@ export default function Home() {
                       <Mountain className="h-4 w-4" aria-hidden />
                       View the recorded result
                     </Button>
+                    <TokenPasteBox datasetTitle={detail.title} />
                   </div>
                 )}
 
@@ -731,9 +801,7 @@ export default function Home() {
                   <p className="mt-2 text-center text-[11px] leading-4 text-[#8A837B]">
                     {detail.mode === 'evidence'
                       ? 'Assembles the real catalog records, official imagery and the model prediction.'
-                      : detail.provenance.dataClass === 'real'
-                        ? 'Typically a few seconds; cross-checking earthquake records can take up to ~20 s.'
-                        : 'Typically a few seconds on demonstration data.'}
+                      : 'Typically a few seconds; cross-checking earthquake records can take up to ~20 s.'}
                   </p>
                 )}
 
@@ -907,14 +975,69 @@ export default function Home() {
                   events={eventsForMap as never}
                   primaryEvent={primaryEvent as never}
                   granulePolys={granulePolys}
+                  beforeAfter={beforeAfter}
+                  wavelengthM={wavelengthM}
+                  swipe={mapMode === 'swipe'}
                 />
                 {grids && detail && (
                   <div className="mt-3 rounded-xl border border-[#E7E2DA] bg-white px-3.5 py-3">
+                    {beforeAfter && (
+                      <div className="mb-3 rounded-lg border border-[#EFE5CC] bg-[#FCF8EE] px-3 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold text-[#7A6438]">Map view</span>
+                          <div role="tablist" aria-label="Map view mode" className="flex overflow-hidden rounded-md border border-[#E3D4AE]">
+                            <button
+                              type="button"
+                              role="tab"
+                              aria-selected={mapMode === 'swipe'}
+                              onClick={() => setMapMode('swipe')}
+                              className={`px-2.5 py-1 text-[11px] transition-colors ${
+                                mapMode === 'swipe' ? 'bg-[#1C1A17] text-white' : 'bg-white text-[#6F6862] hover:bg-[#F7F4EE]'
+                              }`}
+                            >
+                              Before / After
+                            </button>
+                            <button
+                              type="button"
+                              role="tab"
+                              aria-selected={mapMode === 'single'}
+                              onClick={() => setMapMode('single')}
+                              className={`px-2.5 py-1 text-[11px] transition-colors ${
+                                mapMode === 'single' ? 'bg-[#1C1A17] text-white' : 'bg-white text-[#6F6862] hover:bg-[#F7F4EE]'
+                              }`}
+                            >
+                              Single layer
+                            </button>
+                          </div>
+                        </div>
+                        <p className="mt-2 text-[12px] leading-[1.5rem] text-[#4A443C]">
+                          {mapMode === 'swipe' ? (
+                            <>
+                              Drag the divider to compare. NASA&rsquo;s radar took two snapshots of this area{' '}
+                              <strong>{swipeDays ?? 0} days apart</strong> — the colored layer is what{' '}
+                              {beforeAfter.prediction ? (
+                                <>a physics model <strong>predicts</strong> happened in between (a labelled prediction, not a measurement).</>
+                              ) : (
+                                <>was <strong>measured</strong> to have changed in between.</>
+                              )}
+                              {windowQuake && (
+                                <>
+                                  {' '}Between those dates, a <strong>magnitude {windowQuake.magnitude.toFixed(1)}</strong> earthquake
+                                  struck in this area (the red marker).
+                                </>
+                              )}
+                            </>
+                          ) : (
+                            <>The full map, one layer — drag the map and zoom freely; the divider is off.</>
+                          )}
+                        </p>
+                        <p className="mt-1 text-[10.5px] leading-4 text-[#8A837B]">
+                          The photo underneath is a multi-date satellite composite (Esri) — it is not from the radar acquisition dates.
+                        </p>
+                      </div>
+                    )}
                     <div role="tablist" aria-label="Map layer" className="flex flex-wrap overflow-hidden rounded-md border border-[#E7E2DA]">
-                      {(sbasResult
-                        ? (['velocity', 'displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[])
-                        : (['displacement', 'coherence', 'sigma', 'coverage'] as LayerKind[])
-                      ).map((l) => (
+                      {layerOptions.map((l) => (
                         <button
                           key={l}
                           role="tab"
@@ -999,8 +1122,9 @@ export default function Home() {
                       </>
                     ) : (
                       <>
-                        This is the selected study area. After you run the analysis, the measurements appear
-                        here as colors on the map.
+                        This is a real satellite view of the selected study area. The outlined frame marks the patch of
+                        ground the radar will measure. After you run the analysis, the measurements appear here as
+                        colors on the map.
                       </>
                     )}
                   </p>
@@ -1101,7 +1225,7 @@ export default function Home() {
           <p className="text-[11px] leading-4 text-[#8A837B]">
             Data: NASA CMR · ASF DAAC · USGS ComCat · NISAR sample products (ALOS PALSAR via the NISAR SDS).
             MOTUS is a scientific demonstration for the NASA Space Apps Challenge 2026 — not an operational service.
-            Demonstration datasets are clearly labelled and are not observations of the Earth.
+            All areas shown are real NASA data; the synthetic validation fixtures that test the pipeline are never shown as study areas.
             {health && !health.capabilities.liveUsgs && ' (Live earthquake catalog currently unreachable — cached records are used.)'}
           </p>
         </div>

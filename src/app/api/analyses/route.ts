@@ -9,7 +9,7 @@ import {
 import { runPipeline } from '@/lib/science/pipeline';
 import { DEFAULT_PARAMS } from '@/lib/science/types';
 import type { AnalysisResult, TransportGrid, UsgsEventLite } from '@/lib/science/types';
-import { queryUsgsEvents, filterEventsInWindow, loadStaticEvent } from '@/lib/data/usgs';
+import { queryUsgsEvents, filterEventsInWindow, loadStaticEvent, mergeCachedMechanism } from '@/lib/data/usgs';
 import { buildPredictionOnGrid } from '@/lib/science/attribution';
 import { runSbasPipeline } from '@/lib/science/sbas-pipeline';
 import { STACK_ID, centralValleyStack as centralValleyStackRef } from '@/lib/science/stacks';
@@ -89,7 +89,11 @@ async function fetchEventsForDataset(
       endTime: new Date(Date.parse(secondaryTime) + 86400000).toISOString(),
       boundingBox: bbox,
       minMagnitude: 4.0,
-      limit: 50,
+      limit: 200,
+      // Magnitude-descending: with a limit in play, time-ascending order
+      // silently cut the Panama M7.7 mainshock behind its aftershock swarm
+      // (2026-10-24 fix). The biggest event must always survive the cut.
+      orderBy: 'magnitude',
     });
     const centerRef = center ?? { lat: 0, lon: 0 };
     return filterEventsInWindow(events, referenceTime, secondaryTime, centerRef.lat, centerRef.lon, 400);
@@ -249,9 +253,13 @@ export async function POST(req: Request) {
         endTime: new Date(Date.parse(evTime) + 3 * 86400000).toISOString(),
         boundingBox: [-84, 5, -76, 11],
         minMagnitude: 4.0,
-        limit: 60,
+        limit: 200,
+        orderBy: 'magnitude',
       });
-      liveEvents.push(...all);
+      // The cached detailed record carries the moment-tensor product that
+      // the FDSN listing omits — merge it into the matching live event so
+      // mechanism-dependent displays/checks work on live data too.
+      liveEvents.push(...mergeCachedMechanism(all, event));
       liveStatus = 'live';
     } catch {
       liveStatus = 'failed (network) — cached event record shown';

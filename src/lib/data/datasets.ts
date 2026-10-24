@@ -18,8 +18,12 @@
  * Real derived datasets come from tools/extract_gunw.py output (lossless
  * extraction of official NISAR L2 GUNW products). Synthetic fixtures are
  * generated deterministically in-process by src/lib/science/fixtures.ts and
- * are always available offline. The Panama evidence dataset needs only its
- * small cached CMR/USGS JSON records (committed to the repository).
+ * are always available offline — but they are VALIDATION MACHINERY ONLY:
+ * getDataset()/getDatasetAvailability() still resolve them for the test
+ * suite and the /api/v1 plan-spec endpoints, while REGISTRY_ORDER lists only
+ * the real datasets so the UI never offers synthetic data as a study area.
+ * The Panama evidence dataset needs only its small cached CMR/USGS JSON
+ * records (committed to the repository).
  */
 
 import fs from 'fs';
@@ -868,12 +872,8 @@ export interface DatasetListEntry {
 
 const REGISTRY_ORDER = [
   'real-nisar-mojave-2026',
-  'evidence-panama-2026',
-  'stack-central-valley-2026',
   'real-nisar-la-2008',
-  'synthetic-strikeslip',
-  'synthetic-thrust',
-  'synthetic-null',
+  'evidence-panama-2026',
 ] as const;
 
 /**
@@ -925,29 +925,16 @@ export function listDatasets(): DatasetListEntry[] {
         referenceTime = '';
         secondaryTime = '';
         temporalBaselineDays = 12;
-      } else if (id === STACK_ID) {
-        title = 'Central Valley SBAS time series — full system plan pipeline (synthetic stack)';
-        blurb =
-          '21 acquisitions / 24 interferograms on the 12-day repeat cycle (2026 instrument gap ' +
-          'honoured), driving the complete plan pipeline: atmospheric corrections, SBAS WLS ' +
-          'inversion, PELT change-point isolation, Bayesian causal attribution, GNSS and Brier ' +
-          'validation. A synthetic validation fixture parameterized from published Central ' +
-          'Valley rates — not an observation of the Earth.';
-        dataClass = 'synthetic';
-        sensor = 'MOTUS synthetic stack (Track 42 analog, L-band)';
-        referenceTime = '';
-        secondaryTime = '';
-        temporalBaselineDays = 12;
       } else {
-        // Synthetic fixtures are always available; this branch is unreachable
-        // in practice but keeps listing total.
+        // Unreachable for listed ids (the registry lists only real datasets);
+        // kept as a defensive fallback so listing never throws.
         title = id;
         blurb = '';
-        dataClass = 'synthetic';
-        sensor = 'MOTUS synthetic fixture';
+        dataClass = 'real';
+        sensor = '';
         referenceTime = '';
         secondaryTime = '';
-        temporalBaselineDays = 12;
+        temporalBaselineDays = 0;
       }
     }
 

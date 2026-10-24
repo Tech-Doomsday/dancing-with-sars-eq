@@ -78,6 +78,13 @@ export interface UsgsQueryOptions {
   /** [minLon, minLat, maxLon, maxLat] */
   boundingBox?: [number, number, number, number];
   limit?: number;
+  /**
+   * FDSN ordering (2026-10-24 fix). The default time-ascending order caused
+   * a large mainshock to be silently cut by the limit when an aftershock
+   * swarm filled the window: 'magnitude' (descending) is required whenever
+   * a limit is in play.
+   */
+  orderBy?: 'time-asc' | 'time-desc' | 'magnitude';
 }
 
 async function fetchUsgsOnce(url: string, timeoutMs: number): Promise<FdsnFeature[]> {
@@ -104,6 +111,7 @@ export async function queryUsgsEvents(opts: UsgsQueryOptions): Promise<UsgsEvent
     limit: String(opts.limit ?? 30),
     eventtype: 'earthquake',
   });
+  if (opts.orderBy) params.set('orderby', opts.orderBy);
   if (opts.boundingBox) {
     // FDSN event-service parameters (verified 2026-10-20): the service has no
     // combined "boundingbox" query parameter — it requires the four explicit
@@ -186,4 +194,27 @@ export async function loadStaticEvent(path: string): Promise<UsgsEventLite> {
       : undefined,
     momentTensorSource: raw.momentTensorSource as string | undefined,
   };
+}
+
+/**
+ * Merge a cached detailed event record (e.g. the Panama usgs_event.json with
+ * its moment-tensor product) into the matching event of a LIVE query result.
+ *
+ * Why this exists (2026-10-24): the FDSN listing endpoint omits the
+ * moment-tensor product that the detailed per-event record carries. Without
+ * the merge, a live-queried mainshock reaches the attribution layer without
+ * its published fault mechanism, and the Okada forward-model check silently
+ * degrades to "no mechanism available". The merge is id-matched and never
+ * overwrites an existing mechanism.
+ */
+export function mergeCachedMechanism(
+  events: UsgsEventLite[],
+  cached: UsgsEventLite | null | undefined,
+): UsgsEventLite[] {
+  if (!cached?.nodalPlane) return events;
+  return events.map((e) =>
+    e.id === cached.id && !e.nodalPlane
+      ? { ...e, nodalPlane: cached.nodalPlane, momentTensorSource: cached.momentTensorSource }
+      : e,
+  );
 }

@@ -117,6 +117,22 @@ describe('pipeline integration', () => {
     // Transport grid is well-formed.
     expect(res.transport.width).toBeGreaterThan(100);
     expect(res.transport.displacement.length).toBeGreaterThan(1000);
+    // Detected-change transport grid (2026-10-24): present, sized to the
+    // transport resolution, and strictly a subset of the valid mask.
+    expect(res.transport.detected).toBeDefined();
+    const buf = Buffer.from(res.transport.detected!, 'base64');
+    const det = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    expect(det.length).toBe(res.transport.width * res.transport.height);
+    const maskBuf = Buffer.from(res.transport.mask, 'base64');
+    const mask = new Uint8Array(maskBuf.buffer, maskBuf.byteOffset, maskBuf.byteLength);
+    let detectedCells = 0;
+    for (let i = 0; i < det.length; i++) {
+      if (det[i]) {
+        detectedCells++;
+        expect(mask[i]).toBe(1); // detected ⊆ valid
+      }
+    }
+    expect(detectedCells).toBeGreaterThan(0); // the strike-slip fixture IS detected
   });
 
   // Data-dependent: skips with an explicit message when the derived LA
@@ -130,6 +146,8 @@ describe('pipeline integration', () => {
     expect(res.summary.validFraction).toBeGreaterThan(0.05);
     expect(res.summary.coherenceMedian).toBeGreaterThan(0.4);
     expect(res.narrative.reliability).toContain('ionospheric');
+    // The detected-change transport grid exists on the real product too.
+    expect(res.transport.detected).toBeDefined();
   });
 
   test.skipIf(!LA_AVAILABLE)('coherence threshold rejection surfaces a clear error [requires local data]', () => {

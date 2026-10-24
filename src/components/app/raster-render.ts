@@ -13,7 +13,7 @@
  */
 
 import { latLonToUtm, utmToLatLon } from '@/lib/science/utm';
-import { displacementColor, coherenceColor, sigmaColor, niceScaleMax } from './colormap';
+import { displacementColor, coherenceColor, sigmaColor, phaseColor, niceScaleMax } from './colormap';
 import type { DecodedGrids } from './decode';
 
 export interface GridGeo {
@@ -23,7 +23,7 @@ export interface GridGeo {
   lonMax: number;
 }
 
-export type LayerKind = 'velocity' | 'displacement' | 'coherence' | 'sigma' | 'coverage';
+export type LayerKind = 'velocity' | 'displacement' | 'detected' | 'phase' | 'coherence' | 'sigma' | 'coverage';
 
 export interface RenderedOverlay {
   dataUrl: string;
@@ -70,6 +70,9 @@ export function gridBounds(
  * @param meta grid georeferencing (from TransportGrid.meta)
  * @param layer which layer to colour
  * @param vmaxM explicit symmetric max (metres) for displacement; auto if omitted
+ * @param maxCanvasPx canvas size bound
+ * @param wavelengthM radar wavelength (metres) — required only by the 'phase'
+ *   layer, to convert displacement back into wrapped phase fringes
  */
 export function renderOverlay(
   grids: DecodedGrids,
@@ -77,6 +80,7 @@ export function renderOverlay(
   layer: LayerKind,
   vmaxM?: number,
   maxCanvasPx = 1024,
+  wavelengthM?: number,
 ): RenderedOverlay | undefined {
   const geo = gridBounds(meta);
 
@@ -170,6 +174,29 @@ export function renderOverlay(
         img.data[idx + 3] = 235;
         continue;
       }
+      if (layer === 'detected') {
+        // Detected change: solid sign colours ONLY where the server-side
+        // rule (|d| > max(k·σ, floor)) passes; everything else transparent.
+        // The plainest possible highlight of changed ground.
+        if (!grids.detected[gi]) {
+          img.data[idx + 3] = 0;
+          continue;
+        }
+        const v = grids.displacement[gi];
+        const css = Number.isFinite(v)
+          ? displacementColor(v > 0 ? 0.8 : -0.8)
+          : 'rgb(148,140,129)';
+        const m = css.match(/rgb\((\d+),(\d+),(\d+)\)/);
+        if (m) {
+          img.data[idx] = parseInt(m[1], 10);
+          img.data[idx + 1] = parseInt(m[2], 10);
+          img.data[idx + 2] = parseInt(m[3], 10);
+          img.data[idx + 3] = 235;
+        } else {
+          img.data[idx + 3] = 0;
+        }
+        continue;
+      }
       let css: string;
       if (layer === 'displacement' || layer === 'velocity') {
         const v = grids.displacement[gi];
@@ -178,6 +205,19 @@ export function renderOverlay(
           continue;
         }
         css = displacementColor(v / (scaleMax ?? 1));
+      } else if (layer === 'phase') {
+        // Wrapped phase fringes (advanced): displacement is a linear image
+        // of the unwrapped phase (phase = d / (λ/4π)), so the wrapped phase
+        // is exactly recoverable — one full color cycle = λ/2 of LOS motion.
+        const v = grids.displacement[gi];
+        const wl = wavelengthM ?? 0;
+        if (!Number.isFinite(v) || !(wl > 0)) {
+          img.data[idx + 3] = 0;
+          continue;
+        }
+        const losPerRad = wl / (4 * Math.PI);
+        const ph = (v / losPerRad) % (2 * Math.PI);
+        css = phaseColor(ph / (2 * Math.PI));
       } else if (layer === 'coherence') {
         const v = grids.coherence[gi];
         css = coherenceColor(Number.isFinite(v) ? v : 0);
@@ -210,7 +250,7 @@ export function sampleAt(
   meta: { xStart: number; xSpacing: number; yStart: number; ySpacing: number; width: number; height: number; epsg: number },
   lat: number,
   lon: number,
-): { displacement: number; coherence: number; sigma: number } | undefined {
+): { displacement: number; coherence: number; sigma: number; detected: boolean } | undefined {
   const utm = latLonToUtm(lat, lon);
   const gridZone = meta.epsg > 32600 && meta.epsg <= 32660 ? meta.epsg - 32600 : meta.epsg - 32700;
   if (utm.zone !== gridZone) return undefined;
@@ -223,5 +263,6 @@ export function sampleAt(
     displacement: grids.displacement[gi],
     coherence: grids.coherence[gi],
     sigma: grids.sigma[gi],
+    detected: grids.detected[gi] === 1,
   };
 }

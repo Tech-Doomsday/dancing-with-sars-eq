@@ -1,12 +1,12 @@
 'use client';
 
 /**
- * Guided demo tour — a "Start here" walk through the three MOTUS stories in
- * about two minutes, doubling as the script for the demo video.
+ * Guided demo tour — a "Start here" walk through the three REAL MOTUS
+ * stories in about three minutes, doubling as the script for the demo video.
  *
  *  Story 1 · Mojave 2026 (real, recorded)      — the honest negative.
- *  Story 2 · Panama M7.7 (real, evidence)      — real event, real data, model prediction.
- *  Story 3 · Synthetic earthquake lab (demo)   — what a detection looks like.
+ *  Story 2 · Los Angeles 2008 (real, live)     — the NASA sample product, run live.
+ *  Story 3 · Panama M7.7 (real, evidence)      — real event, real data, model prediction.
  *
  * The tour drives the real page: steps can select a dataset, start an
  * analysis, or open the recorded result. Nothing is faked — the narration
@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Play, X, ChevronLeft, ChevronRight, BookOpen, Copy, Check, Clock, Mountain, Globe2, FlaskConical, Layers } from 'lucide-react';
+import { Play, X, ChevronLeft, ChevronRight, BookOpen, Copy, Check, Clock, Mountain, Globe2, Landmark } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogDescription } from '@/components/ui/dialog';
 
@@ -73,7 +73,7 @@ export const TOUR_STORIES: TourStory[] = [
         action: { type: 'recorded' },
         at: 'The verdict',
         narration:
-          'The one-screen answer: NO motion detectable. The radar signal passed through a severely disturbed ionosphere, and that contamination (72 mm) is larger than the biggest apparent signal in the scene (48 mm). Making no claim here is not a failure — it is the scientifically correct result.',
+          'The one-screen answer: NO motion detectable. The radar signal passed through a severely disturbed ionosphere, and that contamination is larger than the biggest apparent signal in the scene — so the honest verdict is “no change detected above the threshold”. Making no claim here is not a failure — it is the scientifically correct result.',
       },
       {
         target: 'seismic-context',
@@ -88,6 +88,44 @@ export const TOUR_STORIES: TourStory[] = [
         at: 'Why it matters',
         narration:
           'That honesty is the point of the tool: MOTUS quantifies what it cannot know. Next — a story where the evidence is much richer.',
+      },
+    ],
+  },
+  {
+    id: 'la2008',
+    title: 'Los Angeles 2008 — the NASA sample product',
+    subtitle: 'A real L-band radar pair over the San Gabriel Mountains, processed by the NISAR science team. Runs live, right here.',
+    icon: <Landmark className="h-5 w-5" aria-hidden />,
+    durationMin: 1,
+    datasetId: 'real-nisar-la-2008',
+    steps: [
+      {
+        target: 'choose-area',
+        action: { type: 'select', datasetId: 'real-nisar-la-2008' },
+        at: 'Real sample data',
+        narration:
+          'This is the open NISAR sample product: a real ALOS PALSAR L-band pair from October–November 2008 over the Los Angeles region, converted into NISAR format by the NISAR science data system. Unlike the Mojave story, the full data is on this server — so the analysis runs LIVE.',
+      },
+      {
+        target: 'step-run',
+        action: { type: 'run' },
+        at: 'Live run',
+        narration:
+          'The real pipeline is running on real radar data, right now: quality masking, phase-to-movement conversion, uncertainty estimation, the detection rule — and a live cross-check against the USGS earthquake catalog for anything that shook between the two radar passes.',
+      },
+      {
+        target: 'step-result',
+        action: { type: 'none' },
+        at: 'The verdict',
+        narration:
+          'The honest answer for this 46-day pair: INCONCLUSIVE — only isolated pixels crossed the threshold, far below the minimum credible area. In radar terms the scene stayed coherent but nothing moved beyond the noise. A tool that can say “inconclusive” on real data is a tool you can trust when it says “detected”.',
+      },
+      {
+        target: 'map-section',
+        action: { type: 'none' },
+        at: 'Explore the map',
+        narration:
+          'Drag the Before/After divider on the map, and hover to read exact values. This is the same map a scientist would explore — try the “Detected change” layer for the plainest view of what passed the threshold.',
       },
     ],
   },
@@ -129,102 +167,12 @@ export const TOUR_STORIES: TourStory[] = [
       },
     ],
   },
-  {
-    id: 'lab',
-    title: 'Earthquake lab — what detection looks like',
-    subtitle: 'A controlled demo with a known strike-slip earthquake built in. The analysis runs for real; the answer can be graded.',
-    icon: <FlaskConical className="h-5 w-5" aria-hidden />,
-    durationMin: 1,
-    datasetId: 'synthetic-strikeslip',
-    steps: [
-      {
-        target: 'choose-area',
-        action: { type: 'select', datasetId: 'synthetic-strikeslip' },
-        at: 'The lab',
-        narration:
-          'So what does a DETECTED earthquake signal actually look like? This is a controlled demonstration: simulated radar data with a known strike-slip earthquake built in. It is a lab — clearly labelled as demo data, not an observation of the Earth.',
-      },
-      {
-        target: 'step-run',
-        action: { type: 'run' },
-        at: 'Real analysis',
-        narration:
-          'The pipeline runs for real on this data: quality masking, phase-to-movement conversion, uncertainty estimation, the detection rule, and the live earthquake cross-check — every stage you would get on real data.',
-      },
-      {
-        target: 'step-result',
-        action: { type: 'none' },
-        at: 'The detection',
-        narration:
-          'Possible change detected: a ~135 mm peak across ~1,370 km². The pattern FITS what an earthquake model predicts for a strike-slip fault — and MOTUS still says “consistent with”, never “caused by”. A single radar view cannot prove cause.',
-      },
-      {
-        target: 'step-result',
-        action: { type: 'none' },
-        at: 'The validation',
-        narration:
-          'Because the truth is known by construction, the measurement can be graded: mean error about 2.6 mm against the built-in answer. That is the validation behind the demonstration — open the “Advanced results” to see it.',
-      },
-      {
-        target: 'scope-note',
-        action: { type: 'none' },
-        at: 'Wrap-up',
-        narration:
-          'Three stories, one tool: measure honestly, attribute carefully, admit limits. Everything you saw is one click away — pick any area and analyze it yourself.',
-      },
-    ],
-  },
-  {
-    id: 'sbas',
-    title: 'Central Valley — the full time-series engine',
-    subtitle: 'The complete research-plan pipeline: SBAS inversion, PELT change points, Bayesian attribution, GNSS + Brier validation.',
-    icon: <Layers className="h-5 w-5" aria-hidden />,
-    durationMin: 2,
-    datasetId: 'stack-central-valley-2026',
-    steps: [
-      {
-        target: 'choose-area',
-        action: { type: 'select', datasetId: 'stack-central-valley-2026' },
-        at: 'The stack',
-        narration:
-          'The research plan calls for time-series analysis, not single pairs. This dataset is a synthetic stack of 21 acquisitions / 24 interferograms over a Central Valley analog — two aquifer-compaction bowls, a tectonic shear gradient, and a synthetic M6.2 blind-thrust earthquake, all with physically-modelled atmosphere.',
-      },
-      {
-        target: 'step-run',
-        action: { type: 'run' },
-        at: 'The full pipeline',
-        narration:
-          'Everything the plan specifies runs for real: stratified-troposphere and ionospheric-ramp corrections, the regularized SBAS inversion with an L-curve-chosen λ, PELT change-point isolation, Bayesian causal attribution, and validation against GNSS and Brier scores.',
-      },
-      {
-        target: 'step-result',
-        action: { type: 'none' },
-        at: 'The verdict',
-        narration:
-          'The one-screen answer now separates two stories: sustained motion (the subsidence bowls, up to ~250 mm/yr) AND a 177 mm time-series step that coincides with the catalog event — detected as a transient, not smeared into a misleading average velocity.',
-      },
-      {
-        target: 'map-section',
-        action: { type: 'none' },
-        at: 'Time slider',
-        narration:
-          'Drag the epoch slider on the map: watch the bowls deepen steadily across the year, then the coseismic step appear at the event epoch. The velocity layer shows sustained motion only — steps were refit out into their own field.',
-      },
-      {
-        target: 'step-result',
-        action: { type: 'none' },
-        at: 'Attribution + validation',
-        narration:
-          'The Bayesian engine ranks causes per anomaly with explicit posteriors and an abstention rule, the coseismic step matches the Okada forward model, and the whole thing is graded: GNSS RMSE ~33 mm/yr, Brier 0.16 against the plan\u2019s 0.15 target, on known synthetic truth.',
-      },
-    ],
-  },
 ];
 
 /** Full demo-video script text (all stories). */
 export function demoScriptText(): string {
   const lines: string[] = [
-    'MOTUS — DEMO VIDEO SCRIPT (approx. 2 minutes)',
+    'MOTUS — DEMO VIDEO SCRIPT (approx. 3 minutes)',
     '================================================',
     '',
   ];
@@ -261,7 +209,7 @@ export function StoryPicker({
         <DialogHeader className="border-b border-[#EFEAE2] px-5 py-4">
           <DialogTitle className="text-[16px] font-semibold text-[#1C1A17]">Take the guided tour</DialogTitle>
           <DialogDescription className="text-[12.5px] leading-[1.45rem] text-[#6F6862]">
-            Three short stories, about two minutes total. The tour drives the real page — nothing is a mockup.
+            Three short real-data stories, about three minutes total. The tour drives the real page — nothing is a mockup.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2.5 px-5 py-4">

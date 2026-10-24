@@ -21,6 +21,12 @@ export interface DecodedGrids {
   coherence: Float32Array;
   mask: Uint8Array;
   sigma: Float32Array;
+  /**
+   * Detected-change mask (2026-10-24): 1 = the server-side rule
+   * (|d| > max(k·σ, floor)) passes. Zero-filled when the transport omits the
+   * field (prediction/velocity transports carry no detection rule).
+   */
+  detected: Uint8Array;
 }
 
 export function decodeTransport(t: {
@@ -30,6 +36,7 @@ export function decodeTransport(t: {
   coherence: string;
   mask: string;
   sigma: string;
+  detected?: string;
 }): DecodedGrids {
   return {
     width: t.width,
@@ -38,5 +45,7 @@ export function decodeTransport(t: {
     coherence: b64ToFloat32(t.coherence),
     mask: b64ToUint8(t.mask),
     sigma: b64ToFloat32(t.sigma),
+    // Tolerant decode: older/prediction transports have no detected grid.
+    detected: t.detected ? b64ToUint8(t.detected) : new Uint8Array(t.width * t.height),
   };
 }

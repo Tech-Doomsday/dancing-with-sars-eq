@@ -63,6 +63,34 @@ export function sigmaColor(t: number): string {
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
+/**
+ * Cyclic colormap for wrapped radar phase (advanced layer). Muted, restrained
+ * tones that cycle seamlessly: terracotta → sand → sage → umber → terracotta.
+ * Each full cycle = one phase wrap = λ/2 of ground movement along the radar
+ * line of sight.
+ */
+const PHASE: RGB[] = [
+  [148, 82, 55], // terracotta
+  [226, 198, 160], // sand
+  [128, 148, 124], // sage
+  [84, 66, 52], // umber
+];
+export function phaseColor(frac: number): string {
+  // frac in [0, 1) wraps naturally through the 4-stop cycle (8 segments
+  // including the return legs); identical at 0 and 1 by construction.
+  const t = ((frac % 1) + 1) % 1;
+  const x = t * PHASE.length;
+  const i = Math.floor(x) % PHASE.length;
+  const j = (i + 1) % PHASE.length;
+  const f = x - Math.floor(x);
+  const c: RGB = [
+    Math.round(lerp(PHASE[i][0], PHASE[j][0], f)),
+    Math.round(lerp(PHASE[i][1], PHASE[j][1], f)),
+    Math.round(lerp(PHASE[i][2], PHASE[j][2], f)),
+  ];
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
 /** Nice round color-scale maximum for displacement (metres). */
 export function niceScaleMax(absMaxM: number): number {
   const mm = Math.max(absMaxM * 1000, 1);

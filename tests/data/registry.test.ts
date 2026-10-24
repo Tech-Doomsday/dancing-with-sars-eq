@@ -41,25 +41,26 @@ describe('dataset registry with all local data present (this repository)', () =>
     _testRoots.browse = REAL_BROWSE;
   });
 
-  test('listing never throws and includes every configured dataset', () => {
+  test('the UI registry lists EXACTLY the real datasets — no synthetic demo data', () => {
     const list = listDatasets();
-    expect(list.length).toBeGreaterThanOrEqual(6);
-    const ids = list.map((d) => d.id);
-    expect(ids).toContain('real-nisar-mojave-2026');
-    expect(ids).toContain('evidence-panama-2026');
-    expect(ids).toContain('real-nisar-la-2008');
-    expect(ids).toContain('synthetic-strikeslip');
-    expect(ids).toContain('synthetic-thrust');
-    expect(ids).toContain('synthetic-null');
+    // Only real datasets are offered as study areas (2026-10-24 contract).
+    expect(list.map((d) => d.id)).toEqual([
+      'real-nisar-mojave-2026',
+      'real-nisar-la-2008',
+      'evidence-panama-2026',
+    ]);
     for (const d of list) {
+      expect(d.dataClass).toBe('real');
       expect(['available', 'missing', 'incomplete', 'invalid']).toContain(d.availability.state);
     }
   });
 
-  test('synthetic fixtures are always available offline', () => {
+  test('synthetic fixtures remain loadable as validation machinery but are never listed', () => {
     expect(getDatasetAvailability('synthetic-strikeslip').state).toBe('available');
     expect(getDatasetAvailability('synthetic-null').state).toBe('available');
     expect(getDataset('synthetic-strikeslip')).toBeDefined();
+    expect(listDatasets().some((d) => d.id.startsWith('synthetic-'))).toBe(false);
+    expect(listDatasets().some((d) => d.id === 'stack-central-valley-2026')).toBe(false);
   });
 
   test('LA dataset present in this repository is available and loads', () => {
@@ -106,7 +107,9 @@ describe('clean clone: no local data at all', () => {
 
   test('listDatasets does not crash and reports missing states with file lists', () => {
     const list = listDatasets();
-    expect(list.length).toBeGreaterThanOrEqual(6);
+    // A clean clone still lists exactly the real datasets (with fallback
+    // titles) — never synthetic ones.
+    expect(list.length).toBe(3);
     const mojave = list.find((d) => d.id === 'real-nisar-mojave-2026')!;
     expect(mojave.availability.state).toBe('missing');
     expect(mojave.availability.missingFiles).toContain('meta.json');
@@ -121,9 +124,9 @@ describe('clean clone: no local data at all', () => {
     expect(panama.availability.state).toBe('missing');
     expect(panama.availability.missingFiles).toContain('granules.json');
 
-    // Synthetic fixtures survive a dataless clone.
-    const synth = list.find((d) => d.id === 'synthetic-strikeslip')!;
-    expect(synth.availability.state).toBe('available');
+    // Synthetic fixtures survive a dataless clone (loadable, not listed).
+    expect(getDatasetAvailability('synthetic-strikeslip').state).toBe('available');
+    expect(list.some((d) => d.id.startsWith('synthetic-'))).toBe(false);
   });
 
   test('getDataset refuses to fabricate data for missing datasets', () => {

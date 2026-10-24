@@ -66,6 +66,40 @@ function downsample(src: Float32Array, w: number, h: number, factor: number): { 
   return { data: out, w: nw, h: nh };
 }
 
+/** Majority-vote downsample of a boolean grid (detected when ≥ half of the
+ * valid contributors pass the rule). */
+function downsampleDetected(
+  detected: Uint8Array,
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  factor: number,
+): { data: Uint8Array; w: number; h: number } {
+  if (factor <= 1) return { data: detected, w, h };
+  const nw = Math.ceil(w / factor);
+  const nh = Math.ceil(h / factor);
+  const out = new Uint8Array(nw * nh);
+  for (let i = 0; i < nh; i++) {
+    for (let j = 0; j < nw; j++) {
+      let hits = 0;
+      let valid = 0;
+      for (let di = 0; di < factor; di++) {
+        for (let dj = 0; dj < factor; dj++) {
+          const si = i * factor + di;
+          const sj = j * factor + dj;
+          if (si >= h || sj >= w) continue;
+          const idx = si * w + sj;
+          if (!mask[idx]) continue;
+          valid++;
+          if (detected[idx]) hits++;
+        }
+      }
+      out[i * nw + j] = valid > 0 && hits / valid >= 0.5 ? 1 : 0;
+    }
+  }
+  return { data: out, w: nw, h: nh };
+}
+
 function downsampleMask(src: Uint8Array, w: number, h: number, factor: number): { data: Uint8Array; w: number; h: number } {
   if (factor <= 1) return { data: src, w, h };
   const nw = Math.ceil(w / factor);
@@ -448,6 +482,21 @@ export function runPipeline(
       ts.data[idx] = NaN;
     }
   }
+  // Detected-change grid (2026-10-24): the exact server-side detection rule
+  // (|d| > max(k·σ, floor), the same rule that produces affectedAreaKm²)
+  // evaluated per full-resolution pixel, then majority-voted into the
+  // transport cells. The client renders it as the plain "where the ground
+  // moved, high confidence" layer.
+  const detectedSrc = new Uint8Array(n);
+  for (let idx = 0; idx < n; idx++) {
+    if (!mask[idx]) continue;
+    const d = disp[idx];
+    if (!Number.isFinite(d)) continue;
+    const s = sigma[idx];
+    const thr = Math.max(params.significanceK * (Number.isFinite(s) ? s : 0), effectiveFloorM);
+    if (Math.abs(d) > thr) detectedSrc[idx] = 1;
+  }
+  const tdet = downsampleDetected(detectedSrc, mask, w, h, factor);
   const transport: TransportGrid = {
     width: td.w,
     height: td.h,
@@ -455,6 +504,7 @@ export function runPipeline(
     coherence: b64(tc.data),
     mask: b64(tm.data),
     sigma: b64(ts.data),
+    detected: b64(tdet.data),
     meta: {
       ...meta,
       width: td.w,
